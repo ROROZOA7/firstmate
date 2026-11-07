@@ -496,6 +496,76 @@ kill_holder
 trap fm_test_cleanup EXIT
 pass "readiness says unknown (or not-receivable) instead of inferring liveness from a lock"
 
+# A genuine empty home can listen without a task or custom check. Exercise the
+# real watcher and the external note route, not just capture with a fake beacon.
+home=$(make_home ready-idle-listen)
+: > "$home/config/inbox-listen"
+perl -e '$0="claude"; sleep 120' &
+holder_pid=$!
+trap 'kill_holder; fm_test_cleanup' EXIT
+sleep 0.2
+printf '%s\n' "$holder_pid" > "$home/state/.lock"
+ready=$(run_inbox "$home" ready) || fail "idle readiness failed"
+assert_equals "False" "$(printf '%s' "$ready" | json_get can_receive)" \
+  "an inbox-listen marker alone must not claim readiness"
+fm_test_track_watcher_state "$home/state"
+FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_CONFIG_OVERRIDE="$home/config" \
+  FM_POLL=1 FM_HEARTBEAT=1 FM_CHECK_INTERVAL=999999 \
+  "$ROOT/bin/fm-watch.sh" > "$home/watch.out" 2> "$home/watch.err" &
+watcher_pid=$!
+for ((i=0; i<300; i++)); do
+  [ -e "$home/state/.heartbeat-streak" ] && break
+  kill -0 "$watcher_pid" 2>/dev/null || break
+  sleep 0.1
+done
+assert_present "$home/state/.heartbeat-streak" "an empty-home heartbeat must complete"
+kill -0 "$watcher_pid" 2>/dev/null || fail "no-change heartbeat exited the idle consumer"
+[ ! -s "$home/watch.out" ] || fail "no-change heartbeat must not wake the model"
+[ ! -s "$home/state/.wake-queue" ] || fail "no-change heartbeat must not enqueue work"
+[ -z "$(find "$home/state" -name '*.meta' -o -name '*.source' -o -name '*.check.sh')" ] \
+  || fail "idle availability must not require fabricated work"
+ready=$(FM_SUPERVISION_MODEL=persistent run_inbox "$home" ready) \
+  || fail "real idle-consumer readiness failed"
+assert_equals "True" "$(printf '%s' "$ready" | json_get can_receive)" \
+  "an empty home with a real live consumer must be ready"
+queued=$(run_inbox "$home" note --request-id idle-browser-route --json "isolated availability probe") \
+  || fail "external idle note failed"
+idle_id=$(printf '%s' "$queued" | json_get id)
+for ((i=0; i<300; i++)); do
+  grep -q '^check: rearm-resurface$' "$home/watch.out" && break
+  kill -0 "$watcher_pid" 2>/dev/null || break
+  sleep 0.1
+done
+# External queue producers close the consumer with a recovery notification;
+# the subsequent supported drain, not watcher stdout, presents the payload.
+assert_grep 'check: rearm-resurface' "$home/watch.out" \
+  "the real idle consumer must notify about the external note"
+wait "$watcher_pid" || fail "idle consumer failed after delivering the inbox event"
+FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_STATE_OVERRIDE="$home/state" \
+  FM_CONFIG_OVERRIDE="$home/config" FM_DATA_OVERRIDE="$home/data" \
+  "$ROOT/bin/fm-wake-drain.sh" > "$home/drain.out" 2> "$home/drain.err" \
+  || fail "isolated wake drain failed"
+assert_grep "captain inbox note $idle_id" "$home/drain.out" \
+  "the supported drain must present the external note payload"
+run_inbox "$home" reply "$idle_id" "isolated probe answered" >/dev/null \
+  || fail "isolated reply failed"
+run_inbox "$home" drain --ack "$idle_id" >/dev/null || fail "isolated note acknowledgement failed"
+ack=$(grep '^WAKE_ACK_REQUIRED:' "$home/drain.err") || fail "wake drain supplied no acknowledgement"
+ack=${ack#*--ack-through }
+sequence=${ack%% *}
+generation=${ack##*--recovery-generation }
+FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_STATE_OVERRIDE="$home/state" \
+  FM_CONFIG_OVERRIDE="$home/config" FM_DATA_OVERRIDE="$home/data" \
+  "$ROOT/bin/fm-wake-drain.sh" --ack-through "$sequence" --recovery-generation "$generation" \
+  || fail "isolated wake acknowledgement failed"
+[ ! -s "$home/state/.wake-queue" ] || fail "handled external note wake stayed queued"
+receipts=$(run_inbox "$home" receipts) || fail "idle probe receipts failed"
+assert_equals "$idle_id" "$(printf '%s' "$receipts" | json_get replies 0 id)" \
+  "external callers must be able to retrieve the reply"
+kill_holder
+trap fm_test_cleanup EXIT
+pass "idle inbox: real consumer absorbs no-change heartbeats and delivers an external note with no fake work"
+
 # --- invalid input ----------------------------------------------------------
 
 home=$(make_home invalid)

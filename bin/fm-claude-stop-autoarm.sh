@@ -24,7 +24,7 @@
 #     this hook exits 0 and NEVER rewakes the primary (checked again at
 #     translation time so a mid-cycle AFK transition is honored).
 #   - Need: arms only while the home needs supervision, as
-#     bin/fm-supervision-lib.sh defines it; an idle home exits 0.
+#     bin/fm-supervision-lib.sh defines it, including its idle inbox opt-in.
 #   - Single-flight: Claude does not dedupe async hooks, so exactly one
 #     GENERATION owner arms per event epoch: the epoch ledger's monotonic
 #     sequence is the claim generation, every firing defers (exit 0) to a live
@@ -373,6 +373,8 @@ autoarm_alarm_banner() {
     need_desc="$FM_SUP_SOURCES process-event source(s) registered"
   elif [ "${FM_SUP_CHECKS:-0}" -gt 0 ]; then
     need_desc="$FM_SUP_CHECKS registered custom check(s)"
+  elif [ "${FM_SUP_INBOX_LISTEN:-false}" = true ]; then
+    need_desc="idle inbox listening enabled"
   else
     need_desc="X-mode relay polling active"
   fi

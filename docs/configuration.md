@@ -3299,6 +3299,16 @@ The two read files use different parsing rules:
 
 `FM_VOICE_RELAY` and `FM_VOICE_PYTHON` belong to the laptop rather than to a home, so they have no config file: `bin/fm-voice-client.py` requires the relay path as a flag or that variable and carries no default path.
 
+### Idle inbox availability (config/inbox-listen)
+
+Create the home-local, gitignored `config/inbox-listen` marker to keep the existing supervision cycle listening for external inbox requests even with no tasks, event sources, or custom checks.
+Its presence is the opt-in; its contents are ignored, and an absent marker preserves the normal idle behavior.
+The shared predicate in `bin/fm-supervision-lib.sh` owns this condition and effective config lookup.
+The marker starts no separate listener, creates no task, and changes no session-ownership or away/quiet-mode checks.
+For a Claude primary, the next ordinary turn end activates the existing Stop-owned cycle; do not manually run its Stop hook or start a second listener.
+No-change heartbeat scans remain tokenless, and `fm-inbox.sh ready` continues to require real consumer health rather than inferring readiness from this marker.
+Use `tests/fm-claude-stop-autoarm.test.sh` and `tests/fm-inbox.test.sh` to verify idle continuity and the capture/readiness contract.
+
 ## Environment variables
 
 Runtime tuning via environment variables (defaults shown):

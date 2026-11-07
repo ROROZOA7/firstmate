@@ -42,6 +42,53 @@ test_predicate_healthy_no_inflight() {
   pass "fm_supervision_unhealthy: false with no state/*.meta at all"
 }
 
+test_predicate_idle_inbox_listening() {
+  local home="$TMP_ROOT/pred-inbox" state config
+  state="$home/state"
+  config="$home/config"
+  mkdir -p "$state" "$config"
+  : > "$config/inbox-listen"
+  FM_HOME="$home" fm_supervision_needed "$state" 300 \
+    || fail "an opted-in idle inbox must keep supervision needed"
+  [ "$FM_SUP_IN_FLIGHT" -eq 0 ] && [ "$FM_SUP_SOURCES" -eq 0 ] && [ "$FM_SUP_CHECKS" -eq 0 ] \
+    || fail "inbox availability must not invent tasks, sources, or checks"
+  [ "$FM_SUP_INBOX_LISTEN" = true ] || fail "the inbox-listen reason must be explicit"
+  : > "$state/last.meta"
+  FM_HOME="$home" fm_supervision_needed "$state" 300 || fail "active home must need supervision"
+  rm "$state/last.meta"
+  FM_HOME="$home" fm_supervision_needed "$state" 300 \
+    || fail "removing the final task must not stop idle inbox listening"
+  FM_HOME="$home" fm_supervision_unhealthy "$state" 300 \
+    || fail "an opted-in inbox with no consumer must still report unhealthy"
+  touch "$state/.last-watcher-beat"
+  if FM_HOME="$home" fm_supervision_unhealthy "$state" 300; then
+    fail "an opted-in inbox with a fresh beacon must not report unhealthy"
+  fi
+  rm "$config/inbox-listen"
+  if FM_HOME="$home" fm_supervision_needed "$state" 300; then
+    fail "removing the explicit opt-in must restore the idle default"
+  fi
+  pass "fm_supervision_needed: inbox opt-in keeps idle and final-task removal supervised without fake work"
+}
+
+test_predicate_inbox_config_scope() {
+  local home="$TMP_ROOT/pred-inbox-scope" other="$TMP_ROOT/pred-inbox-other"
+  mkdir -p "$home/state" "$home/config" "$other/config"
+  : > "$home/config/inbox-listen"
+  if FM_HOME="$home" FM_CONFIG_OVERRIDE="$other/config" fm_supervision_needed "$home/state" 300; then
+    fail "an explicit config override must not read another config's inbox opt-in"
+  fi
+  : > "$other/config/inbox-listen"
+  FM_HOME="$home" FM_CONFIG_OVERRIDE="$other/config" fm_supervision_needed "$home/state" 300 \
+    || fail "the effective config override must control inbox listening"
+  if FM_HOME="$other" fm_supervision_needed "$TMP_ROOT/pred-empty/state" 300; then
+    : # FM_HOME, not the unrelated state directory's parent, owns config.
+  else
+    fail "an explicit operational home must own the config lookup"
+  fi
+  pass "fm_supervision_needed: inbox listening follows effective home and config overrides"
+}
+
 test_predicate_unhealthy_no_beacon() {
   local state="$TMP_ROOT/pred-nobeat/state"
   mkdir -p "$state"
@@ -2661,6 +2708,8 @@ test_hook_no_afk_ignores_poll_derived_grace() {
 }
 
 test_predicate_healthy_no_inflight
+test_predicate_idle_inbox_listening
+test_predicate_inbox_config_scope
 test_predicate_unhealthy_no_beacon
 test_predicate_unhealthy_stale_beacon
 test_predicate_healthy_fresh_beacon

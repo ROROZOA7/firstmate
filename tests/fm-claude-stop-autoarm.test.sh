@@ -441,6 +441,46 @@ test_inert_when_fleet_idle() {
   pass "auto-arm: inert with nothing in flight and no X-mode need"
 }
 
+test_idle_inbox_optin_arms_without_fake_work() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/idle-inbox")
+  : > "$dir/config/inbox-listen"
+  write_arm_fixture "$dir" actionable
+  out=$(run_autoarm "$dir" 2>/dev/null); status=$?
+  expect_code 2 "$status" "an opted-in idle home must deliver an actionable wake"
+  [ -e "$dir/state/arm-ran" ] || fail "idle inbox opt-in did not arm"
+  assert_contains "$out" "firstmate watcher wake" "idle inbox close must use the existing Stop rewake"
+  [ "$(epoch_outcome "$dir")" = rewake ] || fail "idle inbox close did not commit its rewake"
+  pass "auto-arm: explicit inbox listening arms an idle home without dummy work"
+}
+
+test_idle_inbox_optin_survives_last_task_removal() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/idle-inbox-last-task")
+  : > "$dir/config/inbox-listen"
+  : > "$dir/state/task.meta"
+  write_arm_fixture "$dir" meta-vanishes
+  out=$(run_autoarm "$dir" 2>/dev/null); status=$?
+  expect_code 2 "$status" "removing the final task must not discard the opted-in inbox wake"
+  [ ! -e "$dir/state/task.meta" ] || fail "fixture did not actually remove its final task"
+  assert_contains "$out" "firstmate watcher wake" "last task removal must still deliver the wake"
+  [ "$(epoch_outcome "$dir")" = rewake ] || fail "idle transition discarded the rewake"
+  pass "auto-arm: inbox listening survives removal of the final active task"
+}
+
+test_idle_inbox_optin_preserves_quiet_ownership() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/idle-inbox-quiet")
+  : > "$dir/config/inbox-listen"
+  printf 'quiet\n%s\n' "$(date +%s)" > "$dir/state/.afk"
+  write_arm_fixture "$dir" actionable
+  out=$(run_autoarm "$dir" 2>/dev/null); status=$?
+  expect_code 0 "$status" "inbox listening must not take supervision from quiet mode"
+  [ ! -e "$dir/state/arm-ran" ] || fail "idle inbox opt-in armed over quiet mode"
+  [ -z "$out" ] || fail "idle inbox opt-in rewoke a quiet-mode primary"
+  pass "auto-arm: idle inbox opt-in preserves quiet mode ownership"
+}
+
 # --- the armed cycle ----------------------------------------------------------
 
 test_actionable_close_rewakes_with_reason() {
@@ -2223,6 +2263,9 @@ test_inert_when_afk
 test_stale_lock_recovery_preserves_afk_and_need_gates
 test_resolves_outermost_claude_pid_in_nested_bgspare_chain
 test_inert_when_fleet_idle
+test_idle_inbox_optin_arms_without_fake_work
+test_idle_inbox_optin_survives_last_task_removal
+test_idle_inbox_optin_preserves_quiet_ownership
 test_actionable_close_rewakes_with_reason
 test_actionable_close_with_live_successor_rewakes_once
 test_attached_cycle_end_starts_handling_successor
