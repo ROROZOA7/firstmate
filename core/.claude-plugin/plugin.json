@@ -1,0 +1,6 @@
+{
+  "name": "core",
+  "version": "0.1.0",
+  "description": "Default Firstmate worker playbook ported from super-board: build and review methods, TDD, diagnosis, design, review, verification and PR security review.",
+  "license": "MIT"
+}
