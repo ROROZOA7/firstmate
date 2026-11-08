@@ -97,6 +97,7 @@ Each effective `FM_HOME` contains private operational directories.
 - Captain preferences and optional shared captain preferences.
 - Learnings, backlog, briefs, scout reports, optional task status archives, and the optional per-task no-mistakes pipeline-spend ledger.
 - Explicitly installed content-addressed extension packages under `data/extensions/packages/`.
+- Installed content-addressed skill packs under `data/.packs/`, captain-owned project pack bindings under `data/.pack-bindings/`, and each task's frozen pack record at `data/<task>/pack.json` (`bin/fm-pack.sh` owns their formats).
 
 `state/` holds runtime records:
 

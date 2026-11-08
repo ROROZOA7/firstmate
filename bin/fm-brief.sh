@@ -16,6 +16,7 @@
 # PR instead of shipping a new one).
 # Usage: fm-brief.sh <task-id> <repo-name> --mode <no-mistakes|direct-PR|local-only> [--branch-prefix <prefix>] [--base-branch <branch>] [--forge <none|gerrit|forgejo|external> [--shape squash]] [--pr <auto|manual>] [--herdr-lab]
 #        fm-brief.sh <task-id> <repo-name> --scout [--base-branch <branch>] [--herdr-lab]
+#        either crewmate form also takes [--pack <project> [--pack-kind <kind>]]
 #        fm-brief.sh <task-id> --secondmate {<project>...|--no-projects}
 #   --scout writes the scout contract instead: the deliverable is a report at
 #   data/<task-id>/report.md (no branch, no push, no PR) and the worktree is scratch.
@@ -153,6 +154,17 @@
 # regular file, or text carrying its own "Delivery contract: mode=" line (which
 # a later scout promotion could not outrank), stops the scaffold before
 # anything is written. Secondmate charters never take it.
+# --pack <project> attaches the project's bound skill pack (bin/fm-pack.sh owns
+# the pack contract) to a ship or scout brief: before the brief is written it
+# freezes the resolved pack to data/<task-id>/pack.json with `fm-pack.sh
+# record`, then appends the `# Playbook` section rendered from that record, so
+# the brief and the record cannot disagree. The section is its own top-level
+# section after the Definition of done and before any home brief additions,
+# never inside `# Task`, so it never reaches the no-mistakes `--intent`.
+# --pack-kind names the task kind used to pick the pack's task skills and
+# defaults to `default`. A project with no pack bound changes nothing; a bound
+# pack whose readiness check refuses stops the scaffold before anything is
+# written. Refused on --secondmate.
 # Refuses to overwrite an existing brief.
 set -eu
 
@@ -235,6 +247,10 @@ UPSTREAM_CONSENT=
 UPSTREAM_CONSENT_SET=0
 PROJECT_DIR=
 PROJECT_DIR_SET=0
+PACK_PROJECT=
+PACK_SET=0
+PACK_KIND=
+PACK_KIND_SET=0
 POS=()
 want_value=
 for a in "$@"; do
@@ -251,6 +267,8 @@ for a in "$@"; do
       pr) PR_TEXT=$a; PR_TEXT_SET=1 ;;
       upstream-consent) UPSTREAM_CONSENT=$a; UPSTREAM_CONSENT_SET=1 ;;
       project) PROJECT_DIR=$a; PROJECT_DIR_SET=1 ;;
+      pack) PACK_PROJECT=$a; PACK_SET=1 ;;
+      pack-kind) PACK_KIND=$a; PACK_KIND_SET=1 ;;
       *) echo "error: internal parser state for --$want_value" >&2; exit 1 ;;
     esac
     want_value=
@@ -277,6 +295,10 @@ for a in "$@"; do
     --upstream-consent=*) UPSTREAM_CONSENT=${a#--upstream-consent=}; UPSTREAM_CONSENT_SET=1 ;;
     --project) want_value="project" ;;
     --project=*) PROJECT_DIR=${a#--project=}; PROJECT_DIR_SET=1 ;;
+    --pack) want_value="pack" ;;
+    --pack=*) PACK_PROJECT=${a#--pack=}; PACK_SET=1 ;;
+    --pack-kind) want_value="pack-kind" ;;
+    --pack-kind=*) PACK_KIND=${a#--pack-kind=}; PACK_KIND_SET=1 ;;
     # yolo never reaches the worker: it is firstmate's merge authority, not a
     # brief input. Refuse it loudly so it is never silently dropped here and then
     # believed to have been recorded.
@@ -407,6 +429,28 @@ if [ "$KIND" = secondmate ] && [ "$HERDR_LAB" -eq 1 ]; then
   exit 1
 fi
 
+if [ "$PACK_SET" -eq 1 ] || [ "$PACK_KIND_SET" -eq 1 ]; then
+  [ "$KIND" != secondmate ] || {
+    echo "error: --pack and --pack-kind apply only to crewmate ship or scout briefs" >&2
+    exit 1
+  }
+  [ "$PACK_SET" -eq 1 ] || {
+    echo "error: --pack-kind requires --pack <project>" >&2
+    exit 1
+  }
+  case "$PACK_PROJECT" in
+    ''|.|..|*[!A-Za-z0-9._-]*)
+      echo "error: --pack takes a project id ([A-Za-z0-9._-]), got '$PACK_PROJECT'" >&2
+      exit 1 ;;
+  esac
+  case "$PACK_KIND" in
+    *[!A-Za-z0-9._-]*)
+      echo "error: --pack-kind takes a kind label ([A-Za-z0-9._-]), got '$PACK_KIND'" >&2
+      exit 1 ;;
+  esac
+  [ -n "$PACK_KIND" ] || PACK_KIND=default
+fi
+
 if [ "$NO_PROJECTS" -eq 1 ] && [ "$KIND" != secondmate ]; then
   echo "error: --no-projects applies only to --secondmate charters" >&2
   exit 1
@@ -439,7 +483,36 @@ append_brief_include() {
 
 BRIEF="$DATA/$ID/brief.md"
 [ -e "$BRIEF" ] && { echo "error: $BRIEF already exists" >&2; exit 1; }
+
+# The pack is frozen and rendered before the brief exists, so a refusal leaves
+# no partial scaffold; the rendered text is appended after the contract below.
+PACK_SECTION=
+if [ "$PACK_SET" -eq 1 ]; then
+  pack_out=$(FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" FM_CONFIG_OVERRIDE="$CONFIG" \
+    "$SCRIPT_DIR/fm-pack.sh" record "$PACK_PROJECT" --task "$ID" --kind "$PACK_KIND" --json) || {
+    printf '%s\n' "$pack_out" >&2
+    echo "error: --pack $PACK_PROJECT: the pack could not be recorded for this task (refusal above); the brief was not written" >&2
+    exit 1
+  }
+  if printf '%s' "$pack_out" | grep -q '"recorded": true'; then
+    PACK_SECTION=$(FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" FM_CONFIG_OVERRIDE="$CONFIG" \
+      "$SCRIPT_DIR/fm-pack.sh" render-brief "$PACK_PROJECT" --task "$ID" --from-record --heading-level 1) || {
+      rm -f "$DATA/$ID/pack.json"
+      echo "error: --pack $PACK_PROJECT: the recorded pack could not be rendered; the brief was not written" >&2
+      exit 1
+    }
+  else
+    echo "note: --pack $PACK_PROJECT: no pack is bound to that project; the brief carries no Playbook section" >&2
+  fi
+fi
 mkdir -p "$DATA/$ID"
+
+# Append the pack's Playbook section after the contract and before any home
+# brief additions.
+append_pack_section() {
+  [ -n "$PACK_SECTION" ] || return 0
+  printf '\n%s\n' "$PACK_SECTION" >> "$BRIEF"
+}
 
 ASK_USER_BLOCK=
 if [ "$KIND" = ship ] && [ "$MODE" = no-mistakes ]; then
@@ -752,6 +825,7 @@ If the command refuses, report the refusal to firstmate and stop rather than byp
 When the report is complete, append \`done [at=<epoch>]: {one-line conclusion}\` to the status file and stop.
 If your findings reveal work that should ship (e.g. you reproduced a bug and the fix is clear), say so in the report; firstmate may promote this task in place, and you would then receive mode-specific ship instructions as a follow-up message.
 EOF
+append_pack_section
 append_brief_include
 echo "scaffolded: $BRIEF (scout; replace {TASK} and {FIRSTMATE_SPEC})"
 exit 0
@@ -831,6 +905,7 @@ A correction edits only the wrong text: do not run \`$FM_ROOT/bin/fm-ensure-agen
 
 $DOD
 EOF
+append_pack_section
 append_brief_include
 if [ "$PR_TEXT" = manual ]; then
   echo "scaffolded: $BRIEF (ship, mode=$MODE pr=manual; replace {TASK} and {FIRSTMATE_SPEC})"
