@@ -25,7 +25,7 @@ The brief lists the resolved skills. Load them in that order before writing code
   | `refactor` / `tech-debt` | `codebase-design` → `tdd` |
   | `tests` | `tdd` |
   | `docs` | none: skip `tdd`, there is no behaviour to pin |
-  | unclassified | `diagnosing-bugs`, `implement`, `tdd`, `codebase-design` until you can tell bug from feature |
+  | unclassified | `diagnosing-bugs`, `tdd`, `implement`, `codebase-design` until you can tell bug from feature |
 
   Diagnose before you write the red test. Implement against the AC before you reach for
   design vocabulary.
@@ -37,6 +37,12 @@ The brief lists the resolved skills. Load them in that order before writing code
 - **Never inside a worker:** `grilling`, `shape`, `clarify`, `improve-codebase-architecture`,
   or anything else that waits on a human. Wanting one means the ticket needed a human first.
   That is a human gate (preamble).
+
+- **Vendored skills run unattended:** in vendored skills, every "ask/confirm with the user"
+  step maps to the decision ladder, and anything still needing a human becomes
+  `needs-decision: [key=human-gate-<topic>]`. The spec is the brief's Captain's intent and AC;
+  there is no issue-tracker setup. Load pack skills by the absolute paths in the brief, never
+  by bare name (preamble → "Vendored skills run unattended", "Loading pack skills").
 
 ## 2. Testing is three layers
 

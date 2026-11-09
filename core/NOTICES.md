@@ -28,6 +28,16 @@ Each upstream licence's commit is pinned in `pack.yaml` → `skills.vendored[].p
 present. Their licence is not confirmed, so they are not copied. When they're absent, the
 pack's own text fallbacks apply (`policy/fallbacks/`), and those are derived from super-board (MIT).
 
+## Known limitations
+
+- The vendored mattpocock/skills and superpowers texts assume an interactive user (`tdd` confirms
+  seams, `diagnosing-bugs` asks for access, `code-review` asks for the spec and the fixed point,
+  `implement` asks when a ticket is ambiguous). They stay unmodified so licence and provenance
+  stay clean. `policy/preamble.md` → "Vendored skills run unattended" overrides those steps.
+- `implement` sets `disable-model-invocation: true` and invokes `tdd` and `code-review` by bare
+  name, which could load an unpinned global copy. The preamble requires loading pack skills by
+  the absolute paths in the brief. Until Phase B enforcement exists this is advisory only.
+
 ## File modes
 
 All files were normalised to 644 (755 for the one `.sh` template and for directories), as the

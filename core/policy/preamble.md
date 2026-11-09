@@ -49,15 +49,38 @@ If the work so far is salvageable, push it as a draft PR that says which AC are 
 
 ## Recording decisions
 
-Every rung-3 choice goes into `evidence.json` → `decisions[]` (authoritative; squash merges drop
-commit trailers):
+Record **every** decision the ladder settles, at whatever rung, in `evidence.json` →
+`decisions[]` (fm-evidence.v1; authoritative, because squash merges drop commit trailers).
+`rung` is the rung's name: `intent` | `repo-precedent` | `smallest-blast-radius` | `human-gate`.
 
 ```json
-{"question": "…", "chose": "…", "rung": 3, "why": "…"}
+{"rung": "repo-precedent", "choice": "…", "why": "…"}
 ```
 
-Optionally mirror it as a commit trailer `Decision: rung-3: <choice> — <why>`. Never as a
+Optionally mirror it as a commit trailer `Decision: <rung>: <choice> — <why>`. Never as a
 co-author line.
+
+## Vendored skills run unattended
+
+The vendored skills (`tdd`, `diagnosing-bugs`, `implement`, `code-review` and the rest) were
+written for an interactive session. This section overrides them:
+
+- Every "ask / confirm with the user" step maps to the decision ladder. Anything still needing
+  a human becomes `needs-decision: [key=human-gate-<topic>]`. This covers `tdd`'s "confirm the
+  seams with the user": pick the seams by the ladder and record them in `decisions[]`.
+- The spec is the brief's Captain's intent and acceptance criteria. There is no issue-tracker
+  setup: ignore any instruction to run `/setup-matt-pocock-skills` or to fetch a ticket.
+- `code-review`'s fixed point is `git merge-base HEAD origin/<base>`. Never ask for it.
+- `diagnosing-bugs`: when you can't build a feedback loop, don't ask for access, artifacts or
+  production instrumentation. Gate with `needs-decision: [key=human-gate-repro]` and list
+  what you tried.
+
+## Loading pack skills
+
+Load each pack skill from the absolute path the brief gives (`<pack>/skills/<name>/SKILL.md`),
+**never by bare name** through the Skill tool. A bare name such as `tdd` or `code-review` can
+resolve to an unpinned global copy. This also applies when a vendored skill says to invoke
+another skill by name (`implement` does this for `tdd` and `code-review`).
 
 ## Method
 
