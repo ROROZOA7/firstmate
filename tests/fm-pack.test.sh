@@ -270,6 +270,13 @@ test_tree_walk_refusals() {
     [ "$frc" -ne 124 ] || fail "resolve hung on a FIFO in the pack tree"
     assert_contains "$(json 'r["readiness"]["refusals"]' <<<"$out")" "not a regular file: skills/tdd/pipe" "a FIFO in the tree refuses"
   fi
+  # An installed digest directory swapped for a symlink to an identical copy
+  # refuses: the root itself must be a real directory.
+  mv "$pack" "$TMP_ROOT/real-pack-copy"
+  ln -s "$TMP_ROOT/real-pack-copy" "$pack"
+  out=$(run_pack "$h" resolve web --json)
+  rm -f "$pack" && mv "$TMP_ROOT/real-pack-copy" "$pack"
+  assert_contains "$(json 'r["readiness"]["refusals"]' <<<"$out")" "link-unsafe" "a symlinked installed pack directory refuses"
   chmod 000 "$pack/skills/vitest"
   if [ -r "$pack/skills/vitest" ]; then
     chmod 755 "$pack/skills/vitest"
@@ -287,7 +294,7 @@ test_tree_walk_refusals() {
   esac
   assert_equals 0 "$(json 'len([s for s in r["skills"] if s["id"]=="vitest" and s.get("path")])' <<<"$out")" "a refused tree lists no skill paths"
   assert_equals false "$(json 'r["readiness"]["ok"]' <<<"$out")" "an unreadable tree is not ready"
-  pass "fm-pack: the tree walk refuses newline and non-UTF-8 names, a FIFO without blocking, and an unreadable directory instead of skipping it"
+  pass "fm-pack: the tree walk refuses newline and non-UTF-8 names, a FIFO without blocking, a symlinked pack root, and an unreadable directory instead of skipping it"
 }
 
 test_resolve_unbound() {

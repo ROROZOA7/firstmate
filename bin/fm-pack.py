@@ -177,6 +177,8 @@ def _tree_digest(root, installed):
     files = []
     entries = 0
     total = 0
+    # A trailing slash makes lstat follow a symlinked root, so strip it first.
+    root = root.rstrip("/") or "/"
     root_st = os.lstat(root)
     if stat.S_ISLNK(root_st.st_mode) or not stat.S_ISDIR(root_st.st_mode):
         raise Refusal("link-unsafe", "pack root is not a plain directory")
@@ -418,7 +420,9 @@ def find_pack(home, name, version, digest):
     if not PACK_NAME_RE.match(name or "") or not VERSION_RE.match(version or "") or not DIGEST_RE.match(digest or ""):
         raise Refusal("pack-not-installed", f"invalid pack reference {name}@{version}#{digest}")
     path = home.pack_dir(name, version, digest)
-    if not os.path.isdir(path) or os.path.islink(path):
+    if os.path.islink(path):
+        raise Refusal("link-unsafe", f"{name}@{version}#{digest}: the installed pack directory is a symbolic link")
+    if not os.path.isdir(path):
         raise Refusal("pack-not-installed", f"{name}@{version}#{digest} is not installed under data/.packs")
     actual, _ = tree_digest(path, installed=True)
     if actual != digest:
