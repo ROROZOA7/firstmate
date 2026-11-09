@@ -317,8 +317,11 @@ def read_yaml(path, code):
         raise Refusal(code, f"larger than {MAX_YAML_BYTES} bytes: {path}")
     try:
         value = safe_yaml(raw.decode("utf-8"))
-    except (yaml.YAMLError, UnicodeDecodeError, RecursionError) as exc:
-        reason = _yaml_error_position(exc) if isinstance(exc, yaml.YAMLError) else "unparseable (not UTF-8 or too deeply nested)"
+    except (yaml.YAMLError, UnicodeDecodeError, RecursionError, ValueError, TypeError) as exc:
+        # Tag constructors (!!int and the like) raise a plain ValueError or
+        # TypeError whose message quotes the file text, so those get a fixed
+        # reason too.
+        reason = _yaml_error_position(exc) if isinstance(exc, yaml.YAMLError) else "unparseable"
         raise Refusal(code, f"cannot parse {path}: {reason}") from None
     return value, raw
 
@@ -841,7 +844,13 @@ class Repo:
         cannot be read (a timeout, a partial clone missing the blob, a git
         error).
         """
-        if not self.available or rel not in self.files:
+        if not self.available:
+            return None
+        # ls-tree -r lists only blobs, so a directory at rel shows up as paths
+        # beneath it; that is not a regular file either.
+        if any(f.startswith(rel + "/") for f in self.files):
+            return NOT_REGULAR
+        if rel not in self.files:
             return None
         if self.modes.get(rel) not in ("100644", "100755"):
             return NOT_REGULAR
@@ -926,7 +935,7 @@ def parse_repo_narrowing(repo):
         return [], [], [{"item": ".firstmate/pack.yaml", "reason": "not a regular file; nothing narrowed"}]
     try:
         value = safe_yaml(text)
-    except (yaml.YAMLError, ValueError, TypeError, RecursionError) as exc:
+    except (yaml.YAMLError, ValueError, TypeError, RecursionError, UnicodeDecodeError) as exc:
         return [], [], [{"item": ".firstmate/pack.yaml", "reason": _yaml_error_position(exc)}]
     if value is None:
         return [], [], ignored

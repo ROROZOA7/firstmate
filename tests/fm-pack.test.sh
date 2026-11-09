@@ -851,6 +851,49 @@ test_review_round_five() {
   pass "fm-pack: no lazy fetch into partial clones, symlinked repo files refuse, a symref origin is refused, origin moving between resolve and record refuses, and unreadable bindings or unrelated versions are handled cleanly"
 }
 
+test_review_verification() {
+  local h out rc work="$TMP_ROOT/remotes/web-work"
+  h=$(new_home verify)
+  run_pack "$h" install "$SRC" "$CORE_COMMIT" core --json >/dev/null
+  make_project "$h" web
+  # A YAML tag constructor error (a plain ValueError) is a clean refusal that
+  # never echoes the file text, in a binding, in list, and in a repo pack.yaml.
+  mkdir -p "$h/data/.pack-bindings"
+  printf 'pack: !!int SECRETTOKEN\nversion: 0.1.0\ndigest: %s\n' "$CORE_DIGEST" > "$h/data/.pack-bindings/web.yaml"
+  out=$(run_pack "$h" resolve web --json 2>&1); rc=$?
+  expect_code 0 "$rc" "resolve with a bad YAML tag in the binding"
+  assert_contains "$(json 'r["readiness"]["refusals"]' <<<"$out")" "unparseable" "a bad YAML tag refuses as unparseable"
+  assert_not_contains "$out" "SECRETTOKEN" "and never echoes the file text"
+  out=$(run_pack "$h" list --json 2>&1); rc=$?
+  expect_code 0 "$rc" "list with a bad YAML tag in a binding"
+  assert_not_contains "$out" "SECRETTOKEN" "list never echoes it either"
+  bind "$h" web "$CORE_DIGEST"
+  make_project "$h" web .firstmate/pack.yaml
+  printf 'narrow:\n  skills_disable: !!int SECRETTOKEN\n' > "$work/.firstmate/pack.yaml"
+  git -C "$work" commit -qam tag && git -C "$work" push -q "$TMP_ROOT/remotes/web.git" main 2>/dev/null
+  git -C "$h/projects/web" fetch -q origin
+  out=$(run_pack "$h" resolve web --json 2>&1); rc=$?
+  expect_code 0 "$rc" "resolve with a bad YAML tag in the repo pack.yaml"
+  assert_contains "$(json 'r["ignored"]' <<<"$out")" "unparseable" "the repo pack.yaml is ignored as unparseable"
+  assert_not_contains "$out" "SECRETTOKEN" "without echoing it"
+  make_project "$h" web
+  # A manifest with a bad YAML tag refuses at install without echoing it.
+  write_pack "$SRC/badtag" core 0.6.0
+  printf 'model_hint: !!int SECRETTOKEN\n' >> "$SRC/badtag/pack.yaml"
+  sed -i.bak '/^model_hint: null$/d' "$SRC/badtag/pack.yaml" && rm -f "$SRC/badtag/pack.yaml.bak"
+  out=$(run_pack "$h" install "$SRC" "$(commit_src)" badtag --json 2>&1); rc=$?
+  expect_code 3 "$rc" "install of a manifest with a bad YAML tag"
+  assert_not_contains "$out" "SECRETTOKEN" "install never echoes it"
+
+  # A .worktreeinclude that is a directory on origin refuses; a .firstmate/pack.yaml
+  # directory is ignored.
+  make_project "$h" web .worktreeinclude/inner .firstmate/pack.yaml/inner
+  out=$(run_pack "$h" resolve web --json)
+  assert_contains "$(json 'r["readiness"]["refusals"]' <<<"$out")" "not a regular file" "a directory .worktreeinclude refuses"
+  assert_contains "$(json 'r["ignored"]' <<<"$out")" "not a regular file" "a directory .firstmate/pack.yaml is ignored"
+  pass "fm-pack: YAML tag errors refuse without echoing file text in bindings, list, repo files and manifests, and directory .worktreeinclude or pack.yaml paths are not regular files"
+}
+
 test_list_and_show() {
   local out
   out=$(run_pack "$HOME_A" list --json)
@@ -1011,6 +1054,7 @@ fm_test_run \
   test_review_round_three \
   test_review_round_four \
   test_review_round_five \
+  test_review_verification \
   test_list_and_show \
   test_diff \
   test_render_and_record \
