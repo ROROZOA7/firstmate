@@ -766,6 +766,91 @@ test_review_round_four() {
   pass "fm-pack: DWIM decoys of origin's full refnames are never read, YAML errors carry no source text, an unreadable include refuses, and unreadable bindings and pack dirs are never mistaken for absent"
 }
 
+test_review_round_five() {
+  local h out rc work="$TMP_ROOT/remotes/web-work" src pc before after
+  h=$(new_home review5)
+  run_pack "$h" install "$SRC" "$CORE_COMMIT" core --json >/dev/null
+  bind "$h" web "$CORE_DIGEST"
+
+  # A real partial clone: the missing blob is reported unreadable, and nothing
+  # is fetched into the project's object store.
+  src="$TMP_ROOT/pc-src.git"
+  git init -q --bare -b main "$src"
+  git -C "$src" config uploadpack.allowFilter true
+  git -C "$src" config uploadpack.allowAnySHA1InWant true
+  git init -q -b main "$TMP_ROOT/pc-work"
+  printf 'harmless\n' > "$TMP_ROOT/pc-work/.worktreeinclude"
+  git -C "$TMP_ROOT/pc-work" add -A && git -C "$TMP_ROOT/pc-work" commit -q -m init
+  git -C "$TMP_ROOT/pc-work" push -q "file://$src" main 2>/dev/null
+  pc="$h/projects/web"
+  rm -rf "$pc"
+  git clone -q --filter=blob:none --no-checkout "file://$src" "$pc" 2>/dev/null || fail "fixture: partial clone"
+  before=$(find "$pc/.git/objects" -type f | wc -l)
+  out=$(run_pack "$h" resolve web --json)
+  after=$(find "$pc/.git/objects" -type f | wc -l)
+  assert_equals "$before" "$after" "fm-pack fetched nothing into the partial clone"
+  assert_contains "$(json 'r["readiness"]["refusals"]' <<<"$out")" "unreadable" "a missing partial-clone blob refuses as unreadable"
+  make_project "$h" web
+
+  # A symlinked .worktreeinclude refuses; a symlinked .firstmate/pack.yaml is ignored.
+  make_project "$h" web
+  ln -s .env "$work/.worktreeinclude"
+  mkdir -p "$work/.firstmate" && ln -s ../README.md "$work/.firstmate/pack.yaml"
+  git -C "$work" add -A && git -C "$work" commit -qm links && git -C "$work" push -q "$TMP_ROOT/remotes/web.git" main 2>/dev/null
+  git -C "$h/projects/web" fetch -q origin
+  out=$(run_pack "$h" resolve web --json)
+  assert_contains "$(json 'r["readiness"]["refusals"]' <<<"$out")" "not a regular file" "a symlinked .worktreeinclude refuses"
+  assert_contains "$(json 'r["ignored"]' <<<"$out")" "not a regular file" "a symlinked repo pack.yaml is ignored"
+  make_project "$h" web
+
+  # A symbolic ref standing in for origin/main is refused.
+  make_project "$h" web
+  git -C "$h/projects/web" checkout -q -b evil
+  git -C "$h/projects/web" remote set-head origin -d >/dev/null 2>&1
+  git -C "$h/projects/web" update-ref -d refs/remotes/origin/main
+  git -C "$h/projects/web" symbolic-ref refs/remotes/origin/main refs/heads/evil
+  git -C "$h/projects/web" show-ref --verify --quiet refs/remotes/origin/main || fail "fixture: the symref must pass show-ref"
+  out=$(run_pack "$h" resolve web --json)
+  assert_contains "$(json '[x["code"] for x in r["readiness"]["refusals"]]' <<<"$out")" '"project-ref-unknown"' "a symref origin/main is refused"
+  make_project "$h" web
+
+  # The resolve freezes origin's commit; record refuses if origin moved since.
+  out=$(run_pack "$h" resolve web --kind feature --json)
+  assert_equals "$(git -C "$h/projects/web" rev-parse refs/remotes/origin/main)" "$(json 'r["origin"]["commit"]' <<<"$out")" "the resolve records origin's commit"
+  printf '%s\n' "$out" > "$TMP_ROOT/r5-saved.json"
+  printf 'more\n' >> "$work/README.md"
+  git -C "$work" commit -qam moved && git -C "$work" push -q "$TMP_ROOT/remotes/web.git" main 2>/dev/null
+  git -C "$h/projects/web" fetch -q origin
+  out=$(run_pack "$h" record web --task r5 --from-file "$TMP_ROOT/r5-saved.json" --json); rc=$?
+  expect_code 3 "$rc" "record refuses when origin moved after the resolve"
+  assert_contains "$out" "origin" "and says origin moved"
+  assert_absent "$h/data/r5/pack.json" "no record after origin moved"
+
+  # An unreadable bindings dir does not crash list.
+  chmod 000 "$h/data/.pack-bindings"
+  if ! ls "$h/data/.pack-bindings" >/dev/null 2>&1; then
+    out=$(run_pack "$h" list --json); rc=$?
+    chmod 755 "$h/data/.pack-bindings"
+    expect_code 0 "$rc" "list with an unreadable bindings dir"
+    assert_contains "$(json 'r["binding_problems"]' <<<"$out")" "binding-invalid" "list reports the unreadable bindings dir"
+  else
+    chmod 755 "$h/data/.pack-bindings"
+  fi
+  # show is blocked only by an unreadable entry that could hold the requested
+  # digest: another pack's unreadable directory never blocks it, while an
+  # unreadable version of the same pack does (the digest wins over the version,
+  # so that directory could hold the same digest).
+  local other="$h/data/.packs/otherpack/1.0.0" sibling="$h/data/.packs/core/0.9.9"
+  mkdir -p "$other" "$sibling" && chmod 000 "$other" "$sibling"
+  if ! ls "$other" >/dev/null 2>&1; then
+    out=$(run_pack "$h" show "core@0.1.0#$CORE_DIGEST" --json)
+    assert_not_contains "$(json 'r["refusals"]' <<<"$out")" "otherpack" "another pack's unreadable directory does not block show"
+    assert_contains "$(json 'r["refusals"]' <<<"$out")" "core/0.9.9" "an unreadable sibling version of the same pack does"
+  fi
+  chmod 755 "$other" "$sibling" && rmdir "$other" "$sibling" "$h/data/.packs/otherpack"
+  pass "fm-pack: no lazy fetch into partial clones, symlinked repo files refuse, a symref origin is refused, origin moving between resolve and record refuses, and unreadable bindings or unrelated versions are handled cleanly"
+}
+
 test_list_and_show() {
   local out
   out=$(run_pack "$HOME_A" list --json)
@@ -925,6 +1010,7 @@ fm_test_run \
   test_review_round_two \
   test_review_round_three \
   test_review_round_four \
+  test_review_round_five \
   test_list_and_show \
   test_diff \
   test_render_and_record \

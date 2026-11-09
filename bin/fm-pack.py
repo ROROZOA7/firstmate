@@ -242,10 +242,10 @@ class _NoAliasLoader(yaml.SafeLoader):
 
     def compose_node(self, parent, index):
         if self.check_event(yaml.AliasEvent):
-            raise yaml.YAMLError("YAML aliases are not allowed")
+            raise _YamlPolicyError("YAML aliases are not allowed")
         event = self.peek_event()
         if getattr(event, "anchor", None):
-            raise yaml.YAMLError("YAML anchors are not allowed")
+            raise _YamlPolicyError("YAML anchors are not allowed")
         return super().compose_node(parent, index)
 
 
@@ -268,13 +268,19 @@ def safe_yaml(text):
     """Parse YAML with no anchors or aliases and at most MAX_YAML_NODES nodes."""
     value = yaml.load(text, Loader=_NoAliasLoader)  # noqa: S506 - SafeLoader subclass
     if _count_nodes(value, MAX_YAML_NODES) > MAX_YAML_NODES:
-        raise yaml.YAMLError(f"more than {MAX_YAML_NODES} YAML nodes")
+        raise _YamlPolicyError(f"more than {MAX_YAML_NODES} YAML nodes")
     return value
+
+
+class _YamlPolicyError(yaml.YAMLError):
+    """A refusal raised by fm-pack's own YAML rules; its message has no source text."""
 
 
 def _yaml_error_position(exc):
     """'unparseable', plus line and column when PyYAML knows them; never the
     offending source text PyYAML quotes in its message."""
+    if isinstance(exc, _YamlPolicyError):
+        return f"unparseable: {exc}"
     mark = getattr(exc, "problem_mark", None) or getattr(exc, "context_mark", None)
     if mark is not None and isinstance(getattr(mark, "line", None), int):
         return f"unparseable at line {mark.line + 1}, column {mark.column + 1}"
@@ -312,7 +318,8 @@ def read_yaml(path, code):
     try:
         value = safe_yaml(raw.decode("utf-8"))
     except (yaml.YAMLError, UnicodeDecodeError, RecursionError) as exc:
-        raise Refusal(code, f"cannot parse {path}: {str(exc)[:300]}") from None
+        reason = _yaml_error_position(exc) if isinstance(exc, yaml.YAMLError) else "unparseable (not UTF-8 or too deeply nested)"
+        raise Refusal(code, f"cannot parse {path}: {reason}") from None
     return value, raw
 
 
@@ -578,31 +585,44 @@ def find_pack(home, name, version, digest):
     def fault(reason, detail):
         return Refusal("digest-mismatch", f"installed tree {name}#{digest}: {detail}", reason=reason)
 
+    def classify(path):
+        """lstat-based: 'dir' or 'absent', else a digest-mismatch fault."""
+        kind = _dir_kind(path)
+        rel = os.path.relpath(path, home.data)
+        if isinstance(kind, OSError):
+            raise fault("tree-unreadable", f"{rel}: {kind.strerror}")
+        if kind == "link":
+            raise fault("link-unsafe", f"{rel} is a symbolic link")
+        if kind == "other":
+            raise fault("link-unsafe", f"{rel} is not a directory")
+        return kind
+
     candidates = []
-    try:
-        for parent in (home.packs, ndir):
-            if os.path.islink(parent):
-                raise fault("link-unsafe", f"{os.path.relpath(parent, home.data)} is a symbolic link")
-        if os.path.lexists(ndir):
-            if not os.path.isdir(ndir):
-                raise fault("link-unsafe", f"{os.path.relpath(ndir, home.data)} is not a directory")
-            for ver in sorted(os.listdir(ndir)):
-                vdir = os.path.join(ndir, ver)
-                path = os.path.join(vdir, hexd)
-                if not VERSION_RE.match(ver):
-                    continue
-                if os.path.islink(vdir):
-                    if os.path.lexists(path):
-                        raise fault("link-unsafe", f"version directory {name}/{ver} is a symbolic link")
-                    continue
-                # lexists() hides EACCES as "absent"; lstat tells the two apart.
-                try:
-                    os.lstat(path)
-                except FileNotFoundError:
-                    continue
-                candidates.append(path)
-    except OSError as exc:
-        raise fault("tree-unreadable", f"{exc.filename}: {exc.strerror}") from None
+    if classify(home.packs) == "dir" and classify(ndir) == "dir":
+        versions, err = _listdir(ndir)
+        if err is not None:
+            raise fault("tree-unreadable", f"{os.path.relpath(ndir, home.data)}: {err.strerror}")
+        for ver in versions:
+            if not VERSION_RE.match(ver):
+                continue
+            vdir = os.path.join(ndir, ver)
+            vkind = _dir_kind(vdir)
+            path = os.path.join(vdir, hexd)
+            if vkind == "link":
+                # Only a link that would hold this digest matters.
+                if os.path.lexists(path):
+                    raise fault("link-unsafe", f"version directory {name}/{ver} is a symbolic link")
+                continue
+            if isinstance(vkind, OSError):
+                raise fault("tree-unreadable", f"{os.path.relpath(vdir, home.data)}: {vkind.strerror}")
+            if vkind != "dir":
+                continue
+            pkind = _dir_kind(path)
+            if pkind == "absent":
+                continue
+            if isinstance(pkind, OSError):
+                raise fault("tree-unreadable", f"{os.path.relpath(path, home.data)}: {pkind.strerror}")
+            candidates.append(path)
     if not candidates:
         raise Refusal("pack-not-installed", f"{name}#{digest} is not installed under data/.packs")
     if len(candidates) > 1:
@@ -709,11 +729,21 @@ def _verify_list(value, label, code):
     return out
 
 
-def all_bindings(home):
+def all_bindings(home, problems=None):
+    """Load every binding; an unreadable bindings dir is noted in `problems`."""
     out = {}
-    if not os.path.isdir(home.bindings):
+    kind = _dir_kind(home.bindings)
+    if kind == "absent":
         return out
-    for entry in sorted(os.listdir(home.bindings)):
+    if isinstance(kind, OSError) or kind != "dir":
+        if problems is not None:
+            problems.append({"code": "binding-invalid", "detail": "data/.pack-bindings: "
+                             + (kind.strerror if isinstance(kind, OSError) else "not a plain directory")})
+        return out
+    entries, err = _listdir(home.bindings)
+    if err is not None and problems is not None:
+        problems.append({"code": "binding-invalid", "detail": f"data/.pack-bindings: {err.strerror}"})
+    for entry in entries:
         if not entry.endswith(".yaml"):
             continue
         project = entry[: -len(".yaml")]
@@ -730,6 +760,7 @@ def all_bindings(home):
 
 TOO_LARGE = object()
 UNREADABLE = object()
+NOT_REGULAR = object()
 
 
 class Repo:
@@ -740,6 +771,7 @@ class Repo:
         self.ref = None
         self.commit = None
         self.files = None
+        self.modes = {}
         if not os.path.isdir(os.path.join(path, ".git")) and not os.path.isfile(os.path.join(path, ".git")):
             return
         # origin/HEAD names the default branch; without it, origin/main then
@@ -755,23 +787,40 @@ class Repo:
         head = self._git("symbolic-ref", "--quiet", "refs/remotes/origin/HEAD")
         candidates = [head] if head and head.startswith("refs/remotes/origin/") else []
         candidates += ["refs/remotes/origin/main", "refs/remotes/origin/master"]
+        # A candidate that is itself a symbolic ref (refs/remotes/origin/main ->
+        # refs/heads/evil) is refused: for-each-ref on the exact name must
+        # report it with an empty %(symref).
         for ref in candidates:
-            line = self._git("show-ref", "--verify", "--", ref)
-            parts = (line or "").split()
-            if len(parts) == 2 and parts[1] == ref and re.fullmatch(r"[0-9a-f]{40,64}", parts[0]):
-                sha = self._git("rev-parse", "--verify", "--quiet", "--end-of-options", parts[0] + "^{commit}")
-                if sha and re.fullmatch(r"[0-9a-f]{40,64}", sha):
-                    self.ref, self.commit = ref, sha
-                    break
+            out = self._git("for-each-ref", "--format=%(objectname)%00%(refname)%00%(symref)", "--", ref, raw=True)
+            rows = [r for r in (out or "").split("\n") if r]
+            parts = rows[0].split("\0") if len(rows) == 1 else []
+            if len(parts) != 3 or parts[1] != ref or parts[2] != "" or not re.fullmatch(r"[0-9a-f]{40,64}", parts[0]):
+                continue
+            sha = self._git("rev-parse", "--verify", "--quiet", "--end-of-options", parts[0] + "^{commit}")
+            if sha and re.fullmatch(r"[0-9a-f]{40,64}", sha):
+                self.ref, self.commit = ref, sha
+                break
         if self.ref:
-            listing = self._git("ls-tree", "-r", "-z", "--name-only", "--end-of-options", self.commit, raw=True)
+            listing = self._git("ls-tree", "-r", "-z", "--end-of-options", self.commit, raw=True)
             if listing is not None:
-                self.files = [f for f in listing.split("\0") if f]
+                self.files, self.modes = [], {}
+                for item in listing.split("\0"):
+                    if not item or "\t" not in item:
+                        continue
+                    meta, name = item.split("\t", 1)
+                    self.files.append(name)
+                    self.modes[name] = meta.split(" ", 1)[0]
+
+    # Every git call against a project is read-only: no fsmonitor hook, and
+    # no lazy fetch, so a partial clone missing a blob reports it missing
+    # instead of writing it into projects/<p>/.git (AGENTS.md hard rule 1).
+    GIT_ENV = {"GIT_NO_LAZY_FETCH": "1", "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"}
 
     def _git(self, *args, raw=False):
         try:
             res = subprocess.run(["git", "-c", "core.fsmonitor=false", "-C", self.path, *args],
-                                 capture_output=True, timeout=30, check=False)
+                                 capture_output=True, timeout=30, check=False,
+                                 env=dict(os.environ, **self.GIT_ENV))
         except (OSError, subprocess.TimeoutExpired):
             return None
         if res.returncode != 0:
@@ -786,19 +835,23 @@ class Repo:
     def show(self, rel, limit=MAX_YAML_BYTES):
         """The blob at <commit-sha>:<rel>.
 
-        Returns None when the path is not in the tree, TOO_LARGE when over
-        limit, or UNREADABLE when the path is listed but cannot be read
-        (a timeout, a partial clone missing the blob, a git error).
+        Returns None when the path is not in the tree, NOT_REGULAR when it is
+        a symlink, submodule or tree (mode other than 100644/100755),
+        TOO_LARGE when over limit, or UNREADABLE when the path is listed but
+        cannot be read (a timeout, a partial clone missing the blob, a git
+        error).
         """
         if not self.available or rel not in self.files:
             return None
+        if self.modes.get(rel) not in ("100644", "100755"):
+            return NOT_REGULAR
         spec = f"{self.commit}:{rel}"
-        size = self._git("cat-file", "-s", spec)
+        size = self._git("cat-file", "-s", "--end-of-options", spec)
         if size is None or not size.isdigit():
             return UNREADABLE
         if int(size) > limit:
             return TOO_LARGE
-        blob = self._git("cat-file", "blob", spec, raw=True)
+        blob = self._git("cat-file", "blob", "--end-of-options", spec, raw=True)
         return UNREADABLE if blob is None else blob
 
 
@@ -822,6 +875,8 @@ def worktreeinclude_secret(repo):
         return ".worktreeinclude is larger than 64 KB and cannot be checked"
     if text is UNREADABLE:
         return ".worktreeinclude is listed on origin/<default> but unreadable, so it cannot be checked"
+    if text is NOT_REGULAR:
+        return ".worktreeinclude is not a regular file (symlink, submodule or tree), so it cannot be checked"
     for lineno, line in enumerate(text.splitlines(), 1):
         pat = line.strip()
         if not pat or pat.startswith("#") or pat.startswith("!"):
@@ -867,6 +922,8 @@ def parse_repo_narrowing(repo):
         return [], [], [{"item": ".firstmate/pack.yaml", "reason": f"larger than {MAX_YAML_BYTES} bytes"}]
     if text is UNREADABLE:
         return [], [], [{"item": ".firstmate/pack.yaml", "reason": "unreadable; nothing narrowed"}]
+    if text is NOT_REGULAR:
+        return [], [], [{"item": ".firstmate/pack.yaml", "reason": "not a regular file; nothing narrowed"}]
     try:
         value = safe_yaml(text)
     except (yaml.YAMLError, ValueError, TypeError, RecursionError) as exc:
@@ -1062,6 +1119,7 @@ def resolve(home, project, kind=None, harness=None, task=None, labels=None, star
         return {h: value for h in harnesses}
 
     repo = Repo(os.path.join(home.projects, project))
+    out["origin"] = {"ref": repo.ref, "commit": repo.commit}
     # The .worktreeinclude secret gate is never skipped silently.
     readiness["refusals"].extend(repo_gate(project, repo))
     repo_disable, repo_verify, repo_ignored = parse_repo_narrowing(repo)
@@ -1502,7 +1560,8 @@ def _file_kind(rel):
 # --- list / show -----------------------------------------------------------------
 
 def list_packs(home):
-    bindings = all_bindings(home)
+    binding_problems = []
+    bindings = all_bindings(home, binding_problems)
     packs = []
     unreadable = []
     for name, version, digest, path in installed_packs(home, unreadable):
@@ -1530,7 +1589,7 @@ def list_packs(home):
                       "bound_projects": [], "verified": False,
                       "refusal": {"code": "digest-mismatch", "reason": "tree-unreadable",
                                   "detail": f"{os.path.relpath(path, home.data)}: {why}"}})
-    return envelope(home, packs=packs)
+    return envelope(home, packs=packs, binding_problems=binding_problems)
 
 
 def show_pack(home, ref):
@@ -1539,7 +1598,16 @@ def show_pack(home, ref):
     unreadable = []
     candidates = [(n, v, d, p) for n, v, d, p in installed_packs(home, unreadable)
                   if n == name and (version is None or v == version) and (digest is None or d == digest)]
-    blocked = [u for u in unreadable if u[0] in (None, name) and (version is None or u[1] in (None, version))]
+    def could_hold(entry):
+        n, v, path, _why = entry
+        if n not in (None, name) or (version is not None and v not in (None, version)):
+            return False
+        # A listed digest dir that cannot be read only matters if it is the one asked for.
+        leaf = os.path.basename(path)
+        if n is not None and v is not None and HEX_RE.match(leaf):
+            return digest is None or digest == "sha256:" + leaf
+        return True
+    blocked = [u for u in unreadable if could_hold(u)]
     if blocked:
         out["refusals"].extend({"code": "digest-mismatch", "reason": "tree-unreadable",
                                 "detail": f"{os.path.relpath(path, home.data)}: {why}"} for _n, _v, path, why in blocked)
@@ -1676,7 +1744,12 @@ def _fresh_readiness(home, project, frozen):
         find_pack(home, binding["pack"], binding["version"], binding["digest"])
     except Refusal as exc:
         refusals.append(exc.as_dict())
-    refusals.extend(repo_gate(project, Repo(os.path.join(home.projects, project))))
+    repo = Repo(os.path.join(home.projects, project))
+    frozen_origin = frozen.get("origin") if isinstance(frozen.get("origin"), dict) else {}
+    if repo.commit is not None and frozen_origin.get("commit") != repo.commit:
+        refusals.append({"code": "binding-changed", "reason": "origin-moved",
+                         "detail": f"origin/<default> moved from {frozen_origin.get('commit')} to {repo.commit} between render and record"})
+    refusals.extend(repo_gate(project, repo))
     return refusals
 
 

@@ -95,9 +95,16 @@
 # origin/<default> is read by full refname only (refs/remotes/origin/HEAD, else
 # refs/remotes/origin/main, else refs/remotes/origin/master), so a local branch
 # or tag named origin/main is never read; with none readable, readiness refuses
-# project-ref-unknown, so the .worktreeinclude check is never skipped. Repo
-# files are size-checked before they are read, and repo text is never echoed:
-# ignored[] entries describe values by type and length only. YAML anchors and aliases are refused
+# project-ref-unknown, so the .worktreeinclude check is never skipped. A
+# candidate counts only when it exists under exactly that name and is not a
+# symbolic ref; it is resolved once to a commit (recorded as origin.commit),
+# and every read uses <commit>:<path>. Git runs with GIT_NO_LAZY_FETCH=1, so a
+# partial clone's missing blob is reported unreadable, never fetched into the
+# clone. .worktreeinclude and .firstmate/pack.yaml must be regular files.
+# record --from-file refuses binding-changed (reason origin-moved) when origin
+# moved after the resolve. Repo files are size-checked before they are read,
+# and repo text is never echoed: ignored[] entries describe values by type and
+# length only, and YAML errors give a line and column, never source text. YAML anchors and aliases are refused
 # in every file read. Verify commands must be single lines, and no rendered
 # Playbook line may read as a "Delivery contract:" line.
 # Installed packs are found by name and digest; the version is display only.
