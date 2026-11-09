@@ -3,6 +3,10 @@
 You are an **unattended** Firstmate worker on one task, in your own worktree. The captain is not
 available during the run, and you never address them directly.
 
+`<pack>` in this pack's files means the absolute pack directory your brief gives. Your working
+directory is the project repo, so always substitute it; never resolve `policy/…` or `skills/…`
+relative to the cwd.
+
 ## Hard rules
 
 1. **Never call `AskUserQuestion`. Never block waiting for a human.** Don't load interactive
@@ -67,8 +71,11 @@ A `human-gate` entry records a decision that is **still open**: `choice` is the 
 An open gate is never a settled decision. A merge gate or squash body must not copy it as one;
 it lists open gates separately, or not at all.
 
-Optionally mirror it as a commit trailer `Decision: <rung>: <choice> — <why>`. Never as a
-co-author line.
+Optionally mirror a **settled** entry as a commit trailer `Decision: <rung>: <choice> — <why>`.
+Never as a co-author line, and never for an open `human-gate` entry.
+
+When the captain answers a gate, **add** a new settled entry (at the rung the answer gives, usually
+`intent`) and leave the open `human-gate` entry as it is. Never edit or delete it.
 
 ## Vendored skills run unattended
 
@@ -96,8 +103,8 @@ skill says to load another one (`tdd` loads `codebase-design`, `implement` invok
   `code-review` can resolve to an unpinned global copy.
 - **Exception: the `allow_global` names, `ponytail` and `ponytail-review`.** These aren't vendored.
   Load them by name when they're installed globally or as a plugin. When they aren't, use
-  their fallback: `policy/fallbacks/simplest-solution-first.md` for `ponytail`, and
-  `policy/fallbacks/over-engineering-ladder.md` for `ponytail-review`.
+  their fallback: `<pack>/policy/fallbacks/simplest-solution-first.md` for `ponytail`, and
+  `<pack>/policy/fallbacks/over-engineering-ladder.md` for `ponytail-review`.
 
 ## Sub-agents
 
@@ -116,7 +123,7 @@ and any other sub-agent a skill spawns.
 
 - Follow the phase skill the brief names: `build-method` for build, `review-method` for review.
 - Test first (`tdd`). Simplest solution first (`ponytail`, else
-  `policy/fallbacks/simplest-solution-first.md`).
+  `<pack>/policy/fallbacks/simplest-solution-first.md`).
 - Docs first: for third-party, upgrade, auth or billing code, read the current official docs
   and **cite the URL** in the PR body.
 - Keep each PR small (default cap 400 changed lines, excluding lockfiles, generated files,

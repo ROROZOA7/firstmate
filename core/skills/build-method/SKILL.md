@@ -7,7 +7,7 @@ description: Builder method for one unattended Firstmate task. Make the smallest
 
 Ported from super-board's `super-build` lane: the method only. The board glue (cards, labels,
 dispatcher exit codes, merge gate) is gone; Firstmate owns task state and merging. Read
-`policy/preamble.md` first: it holds the unattended rules and the decision ladder this
+`<pack>/policy/preamble.md` first: it holds the unattended rules and the decision ladder this
 method relies on.
 
 ## 1. Load the skills for this task
@@ -30,7 +30,7 @@ The brief lists the resolved skills. Load them in that order before writing code
   Diagnose before you write the red test. Implement against the AC before you reach for
   design vocabulary.
 - **Always, on top of the row:** simplest solution first (`ponytail` if available, otherwise
-  `policy/fallbacks/simplest-solution-first.md`) before the first line of code;
+  `<pack>/policy/fallbacks/simplest-solution-first.md`) before the first line of code;
   `verification-before-completion` before the final commit; `code-review` once on your own diff.
 - **When the situation calls for it:** `testing-strategy` when coverage scope is open; the
   repo's test library (vitest, playwright…) picked by the localisation ladder below, never by kind.

@@ -12,4 +12,4 @@ understood and before the first line of code.
 5. Mark a deliberate corner with a `ponytail:` comment that names its ceiling.
 
 This decides *how little* to write. It never overrides an acceptance criterion, the `tdd` red
-test, or the decision ladder in `policy/preamble.md`.
+test, or the decision ladder in `<pack>/policy/preamble.md`.

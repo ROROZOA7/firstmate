@@ -11,3 +11,7 @@ Packs are pinned by `{repo, commit, path, tree_digest}` and installed by `bin/fm
 Packs: `core/` (pilot, PR #1).
 
 Compute a pack's tree digest (contracts §1): `python3 -I tools/tree_digest.py core`
+
+Known limitation: `tools/tree_digest.py` is a reference implementation. It doesn't walk with
+`openat`/`dir_fd`, so it doesn't catch a parent directory being swapped for a symlink mid-walk.
+`bin/fm-pack.sh`'s install copy is the security boundary.

@@ -8,6 +8,8 @@
 - Each file is opened with O_NOFOLLOW and re-checked on the fd (regular, nlink == 1, same dev/inode/size as lstat);
   exactly the fstat size is hashed, and a file that is shorter or longer than that is refused.
 - Names containing \\n, \\r or a backslash, or that don't encode as UTF-8, are refused.
+- Known limitation: a parent directory swapped for a symlink mid-walk is not caught (no
+  openat/dir_fd walk). fm-pack's install copy is the security boundary, not this script.
 - Limits: at most 4096 entries (files + directories) and 64 MiB of file content in total.
 - Files are stream-hashed in 1 MiB chunks.
 
@@ -24,6 +26,13 @@ class Refuse(Exception):
     pass
 
 
+def lstat(path):
+    try:
+        return os.lstat(path)
+    except OSError as e:
+        raise Refuse(f"cannot stat: {path!r} ({e.strerror})")
+
+
 def check_name(path, name):
     if "\n" in name or "\r" in name or "\\" in name:
         raise Refuse(f"name contains a newline or backslash: {path!r}")
@@ -36,7 +45,7 @@ def check_name(path, name):
 def file_sha256(path, budget):
     """Hash exactly the bytes fstat reports; return (hexdigest, mode, size).
     Refuses before reading if the file is larger than the remaining byte budget."""
-    lst = os.lstat(path)
+    lst = lstat(path)
     if not stat.S_ISREG(lst.st_mode):   # don't open a FIFO/device at all
         raise Refuse(f"not a plain regular file: {path!r}")
     flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
@@ -70,14 +79,15 @@ def on_walk_error(err):
 
 
 def digest(root):
-    if not stat.S_ISDIR(os.lstat(root).st_mode):
+    root = root.rstrip("/") or "/"     # so a trailing slash can't hide a symlinked root
+    if not stat.S_ISDIR(lstat(root).st_mode):
         raise Refuse(f"not a real directory: {root!r}")
     lines, entries, total = [], 0, 0
     for d, dirs, files in os.walk(root, onerror=on_walk_error):
         for name in dirs:
             p = os.path.join(d, name)
             check_name(p, name)
-            if not stat.S_ISDIR(os.lstat(p).st_mode):   # a symlink to a dir lands in dirs
+            if not stat.S_ISDIR(lstat(p).st_mode):   # a symlink to a dir lands in dirs
                 raise Refuse(f"not a real directory: {p!r}")
         entries += len(dirs) + len(files)
         if entries > MAX_ENTRIES:

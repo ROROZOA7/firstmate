@@ -7,7 +7,7 @@ description: Reviewer method for one unattended Firstmate review task. Form your
 
 Ported from super-board's `super-review` lane: the method only. Board glue (card moves, PR
 thread prefixes, the merge gate and its exit codes) is gone. Firstmate's merge gate owns
-merging; this method produces the verdict and the evidence behind it. Read `policy/preamble.md`
+merging; this method produces the verdict and the evidence behind it. Read `<pack>/policy/preamble.md`
 first.
 
 Be conservative: say **merge-ready** only when the findings are clean and verification passed.
@@ -53,7 +53,7 @@ after the highest one used.
 - **Verification miss**: the code may be right, but the evidence doesn't prove it.
 - **Scope drift**: the diff changes what the task didn't ask for, or skips a stated constraint.
 - **Over-engineering**: works, but builds more than the AC needs. Find it with `ponytail-review`
-  if available, else `policy/fallbacks/over-engineering-ladder.md`. Always **Should fix**, **never
+  if available, else `<pack>/policy/fallbacks/over-engineering-ladder.md`. Always **Should fix**, **never
   blocks on its own**. A simplification that would cut validation, security, data-loss
   protection or accessibility is not a finding.
 - **No issue**: a hypothesis or claim you checked that holds. List it under Done with its file:line
@@ -81,13 +81,15 @@ You are the <Code-grounder | Historian> in an adversarial truth-check of PR #<P>
 Job: <Code-grounder: verify every file:line the PR cites still exists and does what the PR
 claims. | Historian: git blame the changed lines; look for ADRs, prior incidents, reverted
 attempts.>
-Read the issue ACs and the diff first and form your own hypotheses. Only then read the
+Read the Captain's intent, the ACs and the diff first and form your own hypotheses. Only then read the
 builder's summary below, as claims to check, not as the frame.
+Captain's intent: <paste>
 ACs: <paste>
 Diff: <merge-base diff or path to it>
 Builder's summary (claims): <paste>
 Unattended: never call AskUserQuestion or wait for a human; no issue tracker or setup step;
-load skills only from <pack>/skills/<name>/SKILL.md, never by bare name; never merge.
+load skills only from <pack>/skills/<name>/SKILL.md (<pack> = the real pack dir from your
+brief; substitute it), never by bare name; never merge.
 Budget: at most 50 gh calls; prefer local git. Over budget: confidence "insufficient_data".
 Class every finding: Gap / Bug / Verification miss / Scope drift / Over-engineering / No issue.
 Severity: Blocker / Should fix / Nit.
