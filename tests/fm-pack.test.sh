@@ -540,7 +540,7 @@ test_review_round_two() {
   out=$(FM_HOME="$h" timeout 20 "$PACK" resolve web --json); rc=$?
   [ "$rc" -ne 124 ] || fail "a billion-laughs repo pack.yaml hung resolve"
   expect_code 0 "$rc" "a billion-laughs repo pack.yaml"
-  assert_contains "$(json 'r["ignored"]' <<<"$out")" "not allowed" "a billion-laughs repo pack.yaml is ignored as unparseable"
+  assert_contains "$(json 'r["ignored"]' <<<"$out")" "unparseable" "a billion-laughs repo pack.yaml is ignored as unparseable"
   [ "${#out}" -lt 200000 ] || fail "the resolve output grew with the alias expansion (${#out} bytes)"
   make_project "$h" web
 
@@ -674,6 +674,96 @@ test_review_round_three() {
   expect_code 3 "$rc" "--require-ready with null readiness"
   assert_contains "$out" "no readiness result" "and says why"
   pass "fm-pack: origin is read by full refname only, one repo gate serves resolve and record, ignored[] never echoes repo text, oversized and unreadable inputs refuse cleanly"
+}
+
+test_review_round_four() {
+  local h out rc clone work="$TMP_ROOT/remotes/web-work"
+  h=$(new_home review4)
+  run_pack "$h" install "$SRC" "$CORE_COMMIT" core --json >/dev/null
+  bind "$h" web "$CORE_DIGEST"
+  # With refs/remotes/origin/main gone, a tag refs/tags/refs/remotes/origin/main
+  # and a branch refs/heads/refs/remotes/origin/master (DWIM decoys for the
+  # full names) are never read: there is no origin default, so readiness refuses.
+  make_project "$h" web .worktreeinclude
+  printf '.env.local\n' > "$work/.worktreeinclude"
+  git -C "$work" commit -qam secret && git -C "$work" push -q "$TMP_ROOT/remotes/web.git" main 2>/dev/null
+  clone="$h/projects/web"
+  git -C "$clone" fetch -q origin
+  git -C "$clone" checkout -q -b decoy
+  printf 'safe-file\n' > "$clone/.worktreeinclude"
+  git -C "$clone" commit -qam decoy
+  git -C "$clone" remote set-head origin -d >/dev/null 2>&1
+  git -C "$clone" update-ref -d refs/remotes/origin/main
+  git -C "$clone" tag refs/remotes/origin/main decoy
+  git -C "$clone" branch refs/remotes/origin/master decoy
+  git -C "$clone" rev-parse --verify --quiet refs/remotes/origin/main >/dev/null \
+    || fail "fixture: the DWIM decoy must resolve for this test to mean anything"
+  out=$(run_pack "$h" resolve web --json)
+  assert_contains "$(json '[x["code"] for x in r["readiness"]["refusals"]]' <<<"$out")" '"project-ref-unknown"' "DWIM decoys of the full refnames are never read"
+  assert_equals false "$(json 'r["readiness"]["ok"]' <<<"$out")" "and the project is not ready"
+  run_pack "$h" resolve web --kind feature --json > "$TMP_ROOT/r4-saved.json"
+  run_pack "$h" record web --task r4 --from-file "$TMP_ROOT/r4-saved.json" --json >/dev/null; rc=$?
+  expect_code 3 "$rc" "record --from-file refuses on the same decoys"
+  make_project "$h" web
+
+  # An unparseable repo pack.yaml is reported by position only, never its text.
+  make_project "$h" web .firstmate/pack.yaml
+  printf 'narrow:\n  skills_disable: [secret-word-xyzzy\n' > "$work/.firstmate/pack.yaml"
+  git -C "$work" commit -qam broken && git -C "$work" push -q "$TMP_ROOT/remotes/web.git" main 2>/dev/null
+  git -C "$h/projects/web" fetch -q origin
+  out=$(run_pack "$h" resolve web --json) || fail "resolve with an unparseable repo pack.yaml"
+  assert_contains "$(json 'r["ignored"]' <<<"$out")" "unparseable" "an unparseable repo pack.yaml is reported"
+  assert_contains "$(json 'r["ignored"]' <<<"$out")" "line " "with its position"
+  assert_not_contains "$out" "xyzzy" "and never its source text"
+  make_project "$h" web
+
+  # A .worktreeinclude listed on origin but unreadable refuses rather than passing.
+  make_project "$h" web .worktreeinclude
+  printf 'harmless\n' > "$work/.worktreeinclude"
+  git -C "$work" commit -qam inc && git -C "$work" push -q "$TMP_ROOT/remotes/web.git" main 2>/dev/null
+  git -C "$h/projects/web" fetch -q origin
+  # Rebuild the clone's object store loose, then drop only the include's blob,
+  # as a partial clone would lack it while still listing the path.
+  local blob objs="$h/projects/web/.git/objects"
+  blob=$(git -C "$h/projects/web" rev-parse refs/remotes/origin/main:.worktreeinclude)
+  for pk in "$objs"/pack/*.pack; do
+    [ -e "$pk" ] || continue
+    mv "$pk" "$TMP_ROOT/held.pack"
+    git -C "$h/projects/web" unpack-objects -q < "$TMP_ROOT/held.pack"
+    rm -f "${pk%.pack}.idx" "${pk%.pack}.rev" "$TMP_ROOT/held.pack"
+  done
+  rm -f "$objs/${blob:0:2}/${blob:2}"
+  git -C "$h/projects/web" cat-file -e "refs/remotes/origin/main^{tree}" 2>/dev/null || fail "fixture: the tree must survive"
+  git -C "$h/projects/web" cat-file -e "$blob" 2>/dev/null && fail "fixture: the include blob must be gone"
+  out=$(run_pack "$h" resolve web --json)
+  assert_contains "$(json 'r["readiness"]["refusals"]' <<<"$out")" "unreadable" "an unreadable listed .worktreeinclude refuses"
+  make_project "$h" web
+
+  # An unreadable binding directory entry is not "unbound".
+  chmod 000 "$h/data/.pack-bindings"
+  if ! ls "$h/data/.pack-bindings" >/dev/null 2>&1; then
+    out=$(run_pack "$h" resolve web --json); rc=$?
+    chmod 755 "$h/data/.pack-bindings"
+    expect_code 0 "$rc" "resolve with an unreadable bindings dir"
+    assert_equals false "$(json 'r["readiness"]["ok"]' <<<"$out")" "an unreadable binding is not treated as unbound"
+    assert_not_contains "$out" '"note": "no pack bound"' "and is not reported as unbound"
+  else
+    chmod 755 "$h/data/.pack-bindings"
+  fi
+  # list and show report an unreadable pack directory instead of hiding it.
+  chmod 000 "$h/data/.packs"
+  if ! ls "$h/data/.packs" >/dev/null 2>&1; then
+    out=$(run_pack "$h" list --json); rc=$?
+    local shown; shown=$(run_pack "$h" show core --json); local src=$?
+    chmod 755 "$h/data/.packs"
+    expect_code 0 "$rc" "list with an unreadable packs dir"
+    assert_contains "$(json '[p["refusal"] for p in r["packs"]]' <<<"$out")" '"tree-unreadable"' "list reports the unreadable packs dir"
+    expect_code 0 "$src" "show with an unreadable packs dir"
+    assert_contains "$(json 'r["refusals"]' <<<"$shown")" '"tree-unreadable"' "show reports it rather than not-installed"
+  else
+    chmod 755 "$h/data/.packs"
+  fi
+  pass "fm-pack: DWIM decoys of origin's full refnames are never read, YAML errors carry no source text, an unreadable include refuses, and unreadable bindings and pack dirs are never mistaken for absent"
 }
 
 test_list_and_show() {
@@ -834,6 +924,7 @@ fm_test_run \
   test_review_round_one \
   test_review_round_two \
   test_review_round_three \
+  test_review_round_four \
   test_list_and_show \
   test_diff \
   test_render_and_record \
