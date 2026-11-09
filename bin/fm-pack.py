@@ -273,10 +273,11 @@ def safe_yaml(text):
 
 
 def summary(value):
-    """A bounded description of a repo-supplied value: never a full repr."""
-    if isinstance(value, str):
-        return f"string({len(value)}) {value[:60]!r}" if len(value) <= 60 else f"string({len(value)})"
-    if isinstance(value, (list, dict)):
+    """Describe a repo-supplied value by type and length only (str(9), list(3)).
+
+    Repo text is never echoed: not in full, not truncated, not repr'd.
+    """
+    if isinstance(value, (str, bytes, list, dict, tuple)):
         return f"{type(value).__name__}({len(value)})"
     return type(value).__name__
 
@@ -286,12 +287,19 @@ def read_yaml(path, code):
         st = os.lstat(path)
     except FileNotFoundError:
         raise Refusal(code, f"missing: {path}") from None
+    except OSError as exc:
+        raise Refusal(code, f"cannot read {path}: {exc.strerror}") from None
     if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
         raise Refusal(code, f"not a regular file: {path}")
     if st.st_size > MAX_YAML_BYTES:
         raise Refusal(code, f"larger than {MAX_YAML_BYTES} bytes: {path}")
-    with open(path, "rb") as fh:
-        raw = fh.read()
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read(MAX_YAML_BYTES + 1)
+    except OSError as exc:
+        raise Refusal(code, f"cannot read {path}: {exc.strerror}") from None
+    if len(raw) > MAX_YAML_BYTES:
+        raise Refusal(code, f"larger than {MAX_YAML_BYTES} bytes: {path}")
     try:
         value = safe_yaml(raw.decode("utf-8"))
     except (yaml.YAMLError, UnicodeDecodeError, RecursionError) as exc:
@@ -457,19 +465,40 @@ def check_pack_tree(root, manifest):
 
 # --- installed packs -----------------------------------------------------------
 
-def installed_packs(home):
-    """Yield (name, version, digest, dir) for every installed digest directory."""
+def _listdir(path):
+    try:
+        return sorted(os.listdir(path)), None
+    except OSError as exc:
+        return [], exc
+
+
+def installed_packs(home, unreadable=None):
+    """Yield (name, version, digest, dir) for every installed digest directory.
+
+    A directory that cannot be listed is skipped here and appended to
+    `unreadable` as (name or None, version or None, path, strerror), so callers
+    can report it instead of crashing.
+    """
     if not os.path.isdir(home.packs):
         return
-    for name in sorted(os.listdir(home.packs)):
+    names, err = _listdir(home.packs)
+    if err is not None and unreadable is not None:
+        unreadable.append((None, None, home.packs, err.strerror))
+    for name in names:
         ndir = os.path.join(home.packs, name)
         if not PACK_NAME_RE.match(name) or not os.path.isdir(ndir) or os.path.islink(ndir):
             continue
-        for version in sorted(os.listdir(ndir)):
+        versions, err = _listdir(ndir)
+        if err is not None and unreadable is not None:
+            unreadable.append((name, None, ndir, err.strerror))
+        for version in versions:
             vdir = os.path.join(ndir, version)
             if not VERSION_RE.match(version) or not os.path.isdir(vdir) or os.path.islink(vdir):
                 continue
-            for entry in sorted(os.listdir(vdir)):
+            entries, err = _listdir(vdir)
+            if err is not None and unreadable is not None:
+                unreadable.append((name, version, vdir, err.strerror))
+            for entry in entries:
                 ddir = os.path.join(vdir, entry)
                 if HEX_RE.match(entry) and os.path.isdir(ddir) and not os.path.islink(ddir):
                     yield name, version, "sha256:" + entry, ddir
@@ -515,8 +544,12 @@ def find_pack(home, name, version, digest):
                     if os.path.lexists(path):
                         raise fault("link-unsafe", f"version directory {name}/{ver} is a symbolic link")
                     continue
-                if os.path.lexists(path):
-                    candidates.append(path)
+                # lexists() hides EACCES as "absent"; lstat tells the two apart.
+                try:
+                    os.lstat(path)
+                except FileNotFoundError:
+                    continue
+                candidates.append(path)
     except OSError as exc:
         raise fault("tree-unreadable", f"{exc.filename}: {exc.strerror}") from None
     if not candidates:
@@ -640,6 +673,9 @@ def all_bindings(home):
 
 # --- project repository reads (origin/<default> only) ---------------------------
 
+TOO_LARGE = object()
+
+
 class Repo:
     """Read-only view of a project's origin/<default> tree."""
 
@@ -650,13 +686,14 @@ class Repo:
         if not os.path.isdir(os.path.join(path, ".git")) and not os.path.isfile(os.path.join(path, ".git")):
             return
         # origin/HEAD names the default branch; without it, origin/main then
-        # origin/master. Only origin's copy is ever read, never a local branch
-        # or a worker's checkout.
-        head = self._git("symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
-        candidates = [head] if head and head.startswith("origin/") else []
-        candidates += ["origin/main", "origin/master"]
+        # origin/master. Full refnames only: a short name such as origin/main
+        # would resolve a local tag or branch of that name first, and pooled
+        # worktrees share those with the clone.
+        head = self._git("symbolic-ref", "--quiet", "refs/remotes/origin/HEAD")
+        candidates = [head] if head and head.startswith("refs/remotes/origin/") else []
+        candidates += ["refs/remotes/origin/main", "refs/remotes/origin/master"]
         for ref in candidates:
-            if self._git("rev-parse", "--verify", "--quiet", ref + "^{commit}"):
+            if self._git("rev-parse", "--verify", "--quiet", "--end-of-options", ref + "^{commit}"):
                 self.ref = ref
                 break
         if self.ref:
@@ -678,10 +715,17 @@ class Repo:
     def available(self):
         return self.files is not None
 
-    def show(self, rel):
+    def show(self, rel, limit=MAX_YAML_BYTES):
+        """The blob at <fullref>:<rel>, None when absent, or TOO_LARGE when over limit."""
         if not self.available:
             return None
-        return self._git("show", f"{self.ref}:{rel}", raw=True)
+        spec = f"{self.ref}:{rel}"
+        size = self._git("cat-file", "-s", spec)
+        if size is None:
+            return None
+        if not size.isdigit() or int(size) > limit:
+            return TOO_LARGE
+        return self._git("cat-file", "blob", spec, raw=True)
 
 
 def glob_holds(repo, pattern):
@@ -697,10 +741,12 @@ def glob_holds(repo, pattern):
 
 
 def worktreeinclude_secret(repo):
-    text = repo.show(".worktreeinclude")
+    text = repo.show(".worktreeinclude", limit=64 * 1024)
     if text is None:
         return None
-    for line in text.splitlines():
+    if text is TOO_LARGE:
+        return ".worktreeinclude is larger than 64 KB and cannot be checked"
+    for lineno, line in enumerate(text.splitlines(), 1):
         pat = line.strip()
         if not pat or pat.startswith("#") or pat.startswith("!"):
             continue
@@ -712,12 +758,27 @@ def worktreeinclude_secret(repo):
         # A literal entry (config/master.key) is itself a name a secret glob
         # matches; a pattern entry (*.env*) is one that would sweep up a
         # typical secret file name.
-        if any(fnmatch.fnmatchcase(base, g) for g in SECRET_GLOBS):
-            return line.strip()
+        for g in SECRET_GLOBS:
+            if fnmatch.fnmatchcase(base, g):
+                return f"line {lineno} matches the secret pattern {g}"
         for sample in SECRET_SAMPLES:
             if fnmatch.fnmatchcase(sample, base) or fnmatch.fnmatchcase(sample, pat):
-                return line.strip()
+                return f"line {lineno} would include a file named {sample}"
     return None
+
+
+def repo_gate(project, repo):
+    """The repository checks every readiness path runs: origin/<default> must
+    be readable, and its .worktreeinclude must not list secrets. Returns
+    refusals; resolve and record --from-file both use this one helper."""
+    if not repo.available:
+        return [{"code": "project-ref-unknown",
+                 "detail": f"projects/{project} has no readable origin/<default> (refs/remotes/origin/HEAD, main or "
+                           "master); conditions, repo narrowing and the .worktreeinclude check cannot run"}]
+    secret = worktreeinclude_secret(repo)
+    if secret is not None:
+        return [{"code": "secret-worktreeinclude", "detail": f".worktreeinclude: {secret}"}]
+    return []
 
 
 def parse_repo_narrowing(repo):
@@ -726,9 +787,9 @@ def parse_repo_narrowing(repo):
     text = repo.show(".firstmate/pack.yaml") if repo.available else None
     if text is None:
         return [], [], ignored
+    if text is TOO_LARGE:
+        return [], [], [{"item": ".firstmate/pack.yaml", "reason": f"larger than {MAX_YAML_BYTES} bytes"}]
     try:
-        if len(text) > MAX_YAML_BYTES:
-            return [], [], [{"item": ".firstmate/pack.yaml", "reason": f"larger than {MAX_YAML_BYTES} bytes"}]
         value = safe_yaml(text)
     except (yaml.YAMLError, ValueError, TypeError, RecursionError) as exc:
         return [], [], [{"item": ".firstmate/pack.yaml", "reason": f"unparseable: {str(exc)[:300]}"}]
@@ -736,16 +797,16 @@ def parse_repo_narrowing(repo):
         return [], [], ignored
     if not isinstance(value, dict):
         return [], [], [{"item": ".firstmate/pack.yaml", "reason": "not a mapping"}]
-    for key in sorted(summary(k) if not isinstance(k, str) else k[:100] for k in value if k != "narrow"):
-        ignored.append({"item": key, "reason": "repo files may only narrow"})
+    for key in sorted(summary(k) for k in value if k != "narrow"):
+        ignored.append({"item": f"key {key}", "reason": "repo files may only narrow"})
     narrow = value.get("narrow")
     if narrow is None:
         narrow = {}
     if not isinstance(narrow, dict):
         ignored.append({"item": "narrow", "reason": "must be a mapping"})
         narrow = {}
-    for key in sorted(summary(k) if not isinstance(k, str) else k[:100] for k in narrow if k not in ("skills_disable", "verify_add")):
-        ignored.append({"item": f"narrow.{key}", "reason": "repo files may only narrow"})
+    for key in sorted(summary(k) for k in narrow if k not in ("skills_disable", "verify_add")):
+        ignored.append({"item": f"narrow key {key}", "reason": "repo files may only narrow"})
     disable = []
     raw_disable = narrow.get("skills_disable")
     if raw_disable is not None and not isinstance(raw_disable, list):
@@ -923,10 +984,8 @@ def resolve(home, project, kind=None, harness=None, task=None, labels=None, star
         return {h: value for h in harnesses}
 
     repo = Repo(os.path.join(home.projects, project))
-    if not repo.available:
-        # The .worktreeinclude secret gate must never be skipped silently.
-        refuse("project-ref-unknown", f"projects/{project} has no readable origin/<default> (origin/HEAD, origin/main or "
-               "origin/master); conditions, repo narrowing and the .worktreeinclude check cannot run")
+    # The .worktreeinclude secret gate is never skipped silently.
+    readiness["refusals"].extend(repo_gate(project, repo))
     repo_disable, repo_verify, repo_ignored = parse_repo_narrowing(repo)
     out["ignored"].extend(repo_ignored)
 
@@ -1041,7 +1100,8 @@ def resolve(home, project, kind=None, harness=None, task=None, labels=None, star
             if any(k[1] == target for k in order):
                 disabled.setdefault(target, source)
             else:
-                out["ignored"].append({"item": f"skills_disable {name}", "reason": "no such skill in this pack"})
+                shown = name if source == "binding" else summary(name)
+                out["ignored"].append({"item": f"{source} skills_disable {shown}", "reason": "no such skill in this pack"})
 
     file_holds_cache = {}
     for phase, sid in order:
@@ -1095,7 +1155,7 @@ def resolve(home, project, kind=None, harness=None, task=None, labels=None, star
     for source, extra in (("binding", binding.get("verify_add") or []), ("repo", repo_verify)):
         for vc in extra:
             if any(v["id"] == vc["id"] for v in verify):
-                out["ignored"].append({"item": f"verify_add {vc['id']}", "reason": "duplicate verify command id"})
+                out["ignored"].append({"item": f"{source} verify_add id {summary(vc['id'])}", "reason": "duplicate verify command id"})
                 continue
             verify.append(dict(vc, origin=source))
     for v in verify:
@@ -1107,10 +1167,6 @@ def resolve(home, project, kind=None, harness=None, task=None, labels=None, star
     out["preamble"] = {"path": manifest["preamble"], "delivery": delivery("advisory")} if manifest["preamble"] else None
     out["model_hint"] = {"value": manifest["model_hint"], "owner": "dispatch"}
     out["evidence"] = manifest["evidence"] or None
-
-    secret = worktreeinclude_secret(repo)
-    if secret is not None:
-        refuse("secret-worktreeinclude", f".worktreeinclude line {secret!r} matches a secret pattern")
 
     readiness["ok"] = not readiness["refusals"]
     return out
@@ -1370,7 +1426,8 @@ def _file_kind(rel):
 def list_packs(home):
     bindings = all_bindings(home)
     packs = []
-    for name, version, digest, path in installed_packs(home):
+    unreadable = []
+    for name, version, digest, path in installed_packs(home, unreadable):
         entry = {"name": name, "version": version, "digest": digest, "source": None, "installed_at": None,
                  "contents": {"skills": 0, "hooks": 0, "mcp": 0}, "risk": [], "update": None,
                  "bound_projects": [{"project": p, "digest": b["digest"]} for p, b in bindings.items()
@@ -1389,6 +1446,12 @@ def list_packs(home):
         except Refusal as exc:
             entry["refusal"] = exc.as_dict()
         packs.append(entry)
+    for name, version, path, why in unreadable:
+        packs.append({"name": name, "version": version, "digest": None, "source": None, "installed_at": None,
+                      "contents": {"skills": 0, "hooks": 0, "mcp": 0}, "risk": [], "update": None,
+                      "bound_projects": [], "verified": False,
+                      "refusal": {"code": "digest-mismatch", "reason": "tree-unreadable",
+                                  "detail": f"{os.path.relpath(path, home.data)}: {why}"}})
     return envelope(home, packs=packs)
 
 
@@ -1529,13 +1592,7 @@ def _fresh_readiness(home, project, frozen):
         find_pack(home, binding["pack"], binding["version"], binding["digest"])
     except Refusal as exc:
         refusals.append(exc.as_dict())
-    repo = Repo(os.path.join(home.projects, project))
-    if not repo.available:
-        refusals.append({"code": "project-ref-unknown", "detail": f"projects/{project} has no readable origin/<default>"})
-    else:
-        secret = worktreeinclude_secret(repo)
-        if secret is not None:
-            refusals.append({"code": "secret-worktreeinclude", "detail": f".worktreeinclude line {secret!r} matches a secret pattern"})
+    refusals.extend(repo_gate(project, Repo(os.path.join(home.projects, project))))
     return refusals
 
 
@@ -1702,9 +1759,11 @@ def main(argv):
                 raise UsageError("render-brief needs --kind <k>")
             r = resolve(home, pos[0], **resolve_kwargs(opts))
         task_dir = os.path.join(home.data, task) if task else None
-        if opts.get("--require-ready") and not (r.get("readiness") or {}).get("ok"):
-            sys.stderr.write("fm-pack: render-brief refused: the pack is not ready: "
-                             + "; ".join(f"{x.get('code')}: {x.get('detail')}" for x in r["readiness"].get("refusals", [])) + "\n")
+        readiness = r.get("readiness") if isinstance(r.get("readiness"), dict) else {}
+        if opts.get("--require-ready") and readiness.get("ok") is not True:
+            refusals = readiness.get("refusals") if isinstance(readiness.get("refusals"), list) else []
+            why = "; ".join(f"{x.get('code')}: {x.get('detail')}" for x in refusals if isinstance(x, dict)) or "no readiness result"
+            sys.stderr.write(f"fm-pack: render-brief refused: the pack is not ready: {why}\n")
             return 3
         try:
             text = render_brief(r, level, task_dir)

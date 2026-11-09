@@ -375,7 +375,8 @@ EOF
   assert_equals '["active"]' "$(json 'list({s["state"] for s in r["skills"] if s["id"]=="tdd"})' <<<"$out")" "the local copy's pack.yaml is ignored"
   assert_equals '["npm test", "npm run e2e"]' "$(json '[v["cmd"] for v in r["verify_commands"]]' <<<"$out")" "repo files may add verify commands but never remove them"
   assert_contains "$(json 'r["ignored"]' <<<"$out")" "repo files may only narrow" "widening keys are reported as ignored"
-  assert_contains "$(json 'r["ignored"]' <<<"$out")" "verify_commands" "a repo verify_commands key is ignored"
+  assert_contains "$(json 'r["ignored"]' <<<"$out")" '"key str(15)"' "a repo verify_commands key is ignored, described by type and length"
+  assert_not_contains "$(json 'r["ignored"]' <<<"$out")" "verify_commands" "ignored[] never echoes repo text"
   pass "fm-pack: file:<glob> conditions and narrowing are read from origin/<default> only, and repo files can only narrow"
 }
 
@@ -589,6 +590,92 @@ test_review_round_two() {
   pass "fm-pack: an invalid binding is not unbound, stale records go, a missing origin ref refuses, YAML aliases and multi-line or contract-like verify commands refuse, layout faults never raise, and record re-checks readiness"
 }
 
+test_review_round_three() {
+  local h out rc ndir work="$TMP_ROOT/remotes/web-work"
+  h=$(new_home review3)
+  run_pack "$h" install "$SRC" "$CORE_COMMIT" core --json >/dev/null
+  bind "$h" web "$CORE_DIGEST"
+  # A local branch and a tag named origin/main (shared by pooled worktrees)
+  # never stand in for origin's tree, so a secret include on origin still refuses.
+  make_project "$h" web .worktreeinclude
+  printf '.env.local\n' > "$work/.worktreeinclude"
+  git -C "$work" commit -qam secret && git -C "$work" push -q "$TMP_ROOT/remotes/web.git" main 2>/dev/null
+  git -C "$h/projects/web" fetch -q origin
+  git -C "$h/projects/web" checkout -q -b decoy
+  printf 'safe-file\n' > "$h/projects/web/.worktreeinclude"
+  git -C "$h/projects/web" commit -qam decoy
+  git -C "$h/projects/web" branch -q origin/main decoy
+  git -C "$h/projects/web" tag origin/main decoy
+  git -C "$h/projects/web" tag origin/master decoy
+  git -C "$h/projects/web" remote set-head origin -d >/dev/null 2>&1
+  out=$(run_pack "$h" resolve web --json)
+  assert_contains "$(json 'r["readiness"]["refusals"]' <<<"$out")" "secret-worktreeinclude" "a local origin/main branch or tag never replaces origin's tree"
+  run_pack "$h" resolve web --kind feature --json > "$TMP_ROOT/r3-saved.json"
+  run_pack "$h" record web --task r3 --from-file "$TMP_ROOT/r3-saved.json" --json >/dev/null; rc=$?
+  expect_code 3 "$rc" "record --from-file applies the same repo gate"
+  # The secret refusal names the line and pattern, never the line's text.
+  assert_contains "$(json 'r["readiness"]["refusals"]' <<<"$out")" "line 1 matches the secret pattern .env*" "the refusal names the line and pattern"
+  assert_not_contains "$(json 'r["readiness"]["refusals"]' <<<"$out")" ".env.local" "the refusal never echoes repo text"
+  make_project "$h" web
+
+  # ignored[] describes repo values by type and length only.
+  make_project "$h" web .firstmate/pack.yaml
+  printf 'narrow:\n  "evil\\u0007key": 1\n  skills_disable: ["%s"]\n  verify_add:\n    - {id: unit, cmd: "echo dup-%s"}\n' \
+    "$(head -c 300 /dev/zero | tr '\0' x)" "$(head -c 300 /dev/zero | tr '\0' y)" > "$work/.firstmate/pack.yaml"
+  git -C "$work" commit -qam echo && git -C "$work" push -q "$TMP_ROOT/remotes/web.git" main 2>/dev/null
+  git -C "$h/projects/web" fetch -q origin
+  out=$(run_pack "$h" resolve web --json) || fail "resolve with hostile repo values"
+  assert_not_contains "$(json 'r["ignored"]' <<<"$out")" "evil" "a narrow key is not echoed"
+  assert_not_contains "$(json 'r["ignored"]' <<<"$out")" "xxxxxxxxxx" "a skills_disable value is not echoed"
+  assert_not_contains "$(json 'r["ignored"]' <<<"$out")" "unit" "a duplicate verify_add id is not echoed"
+  assert_contains "$(json 'r["ignored"]' <<<"$out")" '"repo verify_add id str(4)"' "a duplicate verify_add id is described"
+  make_project "$h" web
+
+  # An oversized .worktreeinclude cannot be checked, so it refuses.
+  make_project "$h" web .worktreeinclude
+  head -c 70000 /dev/zero | tr '\0' 'a' > "$work/.worktreeinclude"
+  git -C "$work" commit -qam big && git -C "$work" push -q "$TMP_ROOT/remotes/web.git" main 2>/dev/null
+  git -C "$h/projects/web" fetch -q origin
+  out=$(run_pack "$h" resolve web --json)
+  assert_contains "$(json 'r["readiness"]["refusals"]' <<<"$out")" "larger than 64 KB" "an oversized .worktreeinclude refuses"
+  make_project "$h" web
+
+  # An unreadable version dir is a digest mismatch, not "not installed".
+  ndir="$h/data/.packs/core/0.1.0"
+  chmod 000 "$ndir"
+  if ! ls "$ndir" >/dev/null 2>&1; then
+    out=$(run_pack "$h" resolve web --json); rc=$?
+    local listed; listed=$(run_pack "$h" list --json); local lrc=$?
+    chmod 755 "$ndir"
+    expect_code 0 "$rc" "resolve with an unreadable version dir"
+    assert_equals '[["digest-mismatch", "tree-unreadable"]]' "$(json '[[x["code"], x.get("reason")] for x in r["readiness"]["refusals"]]' <<<"$out")" "an unreadable version dir"
+    expect_code 0 "$lrc" "list with an unreadable version dir"
+    assert_contains "$(json '[p["refusal"] for p in r["packs"]]' <<<"$listed")" '"tree-unreadable"' "list reports the unreadable dir"
+  else
+    chmod 755 "$ndir"
+  fi
+  # An unreadable binding file is not ready and names the file.
+  chmod 000 "$h/data/.pack-bindings/web.yaml"
+  if ! cat "$h/data/.pack-bindings/web.yaml" >/dev/null 2>&1; then
+    out=$(run_pack "$h" resolve web --json); rc=$?
+    local d; d=$(run_pack "$h" diff web --to "core@0.1.0#$CORE_DIGEST" --json); local drc=$?
+    chmod 644 "$h/data/.pack-bindings/web.yaml"
+    expect_code 0 "$rc" "resolve with an unreadable binding"
+    assert_equals false "$(json 'r["readiness"]["ok"]' <<<"$out")" "an unreadable binding is not ready"
+    assert_equals data/.pack-bindings/web.yaml "$(json 'r["binding_file"]' <<<"$out")" "and names the binding file"
+    expect_code 0 "$drc" "diff with an unreadable binding"
+    assert_contains "$(json 'r["refusals"]' <<<"$d")" "binding-invalid" "diff reports the unreadable binding"
+  else
+    chmod 644 "$h/data/.pack-bindings/web.yaml"
+  fi
+  # --require-ready on a saved resolve with no readiness exits 3 cleanly.
+  printf '{"schema": "fm-pack.v1", "project": "web", "binding": {"pack": "core", "version": "0.1.0", "digest": "%s"}, "readiness": null}\n' "$CORE_DIGEST" > "$TMP_ROOT/no-readiness.json"
+  out=$(run_pack "$h" render-brief web --from-file "$TMP_ROOT/no-readiness.json" --require-ready 2>&1); rc=$?
+  expect_code 3 "$rc" "--require-ready with null readiness"
+  assert_contains "$out" "no readiness result" "and says why"
+  pass "fm-pack: origin is read by full refname only, one repo gate serves resolve and record, ignored[] never echoes repo text, oversized and unreadable inputs refuse cleanly"
+}
+
 test_list_and_show() {
   local out
   out=$(run_pack "$HOME_A" list --json)
@@ -746,6 +833,7 @@ fm_test_run \
   test_readiness_refusals \
   test_review_round_one \
   test_review_round_two \
+  test_review_round_three \
   test_list_and_show \
   test_diff \
   test_render_and_record \
