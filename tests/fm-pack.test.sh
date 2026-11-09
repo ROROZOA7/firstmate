@@ -268,7 +268,8 @@ test_tree_walk_refusals() {
     out=$(FM_HOME="$h" timeout 20 "$PACK" resolve web --json); local frc=$?
     rm -f "$pack/skills/tdd/pipe"
     [ "$frc" -ne 124 ] || fail "resolve hung on a FIFO in the pack tree"
-    assert_contains "$(json 'r["readiness"]["refusals"]' <<<"$out")" "not a regular file: skills/tdd/pipe" "a FIFO in the tree refuses"
+    assert_equals '[["digest-mismatch", "link-unsafe"]]' "$(json '[[x["code"], x.get("reason")] for x in r["readiness"]["refusals"]]' <<<"$out")" "a FIFO in an installed tree is a digest mismatch with its reason"
+    assert_contains "$(json 'r["readiness"]["refusals"]' <<<"$out")" "not a regular file: skills/tdd/pipe" "the FIFO is named"
   fi
   # An installed digest directory swapped for a symlink to an identical copy
   # refuses: the root itself must be a real directory.
@@ -276,7 +277,7 @@ test_tree_walk_refusals() {
   ln -s "$TMP_ROOT/real-pack-copy" "$pack"
   out=$(run_pack "$h" resolve web --json)
   rm -f "$pack" && mv "$TMP_ROOT/real-pack-copy" "$pack"
-  assert_contains "$(json 'r["readiness"]["refusals"]' <<<"$out")" "link-unsafe" "a symlinked installed pack directory refuses"
+  assert_equals '[["digest-mismatch", "link-unsafe"]]' "$(json '[[x["code"], x.get("reason")] for x in r["readiness"]["refusals"]]' <<<"$out")" "a symlinked installed pack directory refuses"
   chmod 000 "$pack/skills/vitest"
   if [ -r "$pack/skills/vitest" ]; then
     chmod 755 "$pack/skills/vitest"
@@ -287,9 +288,9 @@ test_tree_walk_refusals() {
   chmod 755 "$pack/skills/vitest"
   expect_code 0 "$rc" "resolve reports an unreadable tree as data"
   # The installed-mode check sees the 000 directory before the walk tries to
-  # list it, so either refusal proves the tree was refused rather than skipped.
-  case "$(json '[x["code"] for x in r["readiness"]["refusals"]]' <<<"$out")" in
-    *'"tree-unreadable"'*|*'"mode-unsafe"'*) ;;
+  # list it, so either reason proves the tree was refused rather than skipped.
+  case "$(json '[[x["code"], x.get("reason")] for x in r["readiness"]["refusals"]]' <<<"$out")" in
+    *'["digest-mismatch", "tree-unreadable"]'*|*'["digest-mismatch", "mode-unsafe"]'*) ;;
     *) fail "an unreadable directory must refuse, got: $(json 'r["readiness"]' <<<"$out")" ;;
   esac
   assert_equals 0 "$(json 'len([s for s in r["skills"] if s["id"]=="vitest" and s.get("path")])' <<<"$out")" "a refused tree lists no skill paths"
@@ -428,8 +429,64 @@ test_readiness_refusals() {
   chmod u+w "$h/data/.packs/core/0.1.0/${CORE_DIGEST#sha256:}/skills/tdd/SKILL.md"
   printf 'tampered\n' >> "$h/data/.packs/core/0.1.0/${CORE_DIGEST#sha256:}/skills/tdd/SKILL.md"
   out=$(run_pack "$h" resolve web --json) || fail "resolve exits 0 on a refusal"
-  assert_contains "$(json 'r["readiness"]["refusals"]' <<<"$out")" "digest-mismatch" "a tampered install refuses"
+  assert_equals '[["digest-mismatch", "content-changed"]]' "$(json '[[x["code"], x.get("reason")] for x in r["readiness"]["refusals"]]' <<<"$out")" "a tampered install refuses"
   pass "fm-pack: readiness refuses an absent pack, a tampered digest, a secret .worktreeinclude, no verify commands and an invalid binding, exiting 0"
+}
+
+test_review_round_one() {
+  local h out entry v_digest
+  h=$(new_home review)
+  run_pack "$h" install "$SRC" "$CORE_COMMIT" core --json >/dev/null
+  bind "$h" web "$CORE_DIGEST"
+  # Literal .worktreeinclude entries are checked against the secret globs too.
+  for entry in .env.test config/master.key deploy.pem credentials.yml; do
+    make_project "$h" web .worktreeinclude
+    printf '%s\n' "$entry" > "$TMP_ROOT/remotes/web-work/.worktreeinclude"
+    git -C "$TMP_ROOT/remotes/web-work" commit -qam include && git -C "$TMP_ROOT/remotes/web-work" push -q "$TMP_ROOT/remotes/web.git" main 2>/dev/null
+    git -C "$h/projects/web" fetch -q origin
+    out=$(run_pack "$h" resolve web --json)
+    assert_contains "$(json 'r["readiness"]["refusals"]' <<<"$out")" "secret-worktreeinclude" ".worktreeinclude entry $entry refuses"
+  done
+  # A repo-controlled pack.yaml of the wrong shape is reported, never a traceback.
+  make_project "$h" web .firstmate/pack.yaml
+  printf 'narrow:\n  skills_disable: tdd\n  verify_add: {id: x}\n1: one\nnarrow2: [a]\n' > "$TMP_ROOT/remotes/web-work/.firstmate/pack.yaml"
+  git -C "$TMP_ROOT/remotes/web-work" commit -qam shape && git -C "$TMP_ROOT/remotes/web-work" push -q "$TMP_ROOT/remotes/web.git" main 2>/dev/null
+  git -C "$h/projects/web" fetch -q origin
+  out=$(run_pack "$h" resolve web --json) || fail "resolve must exit 0 on a malformed repo pack.yaml"
+  assert_equals true "$(json 'r["readiness"]["ok"]' <<<"$out")" "a malformed repo file narrows nothing and refuses nothing"
+  assert_contains "$(json 'r["ignored"]' <<<"$out")" "must be a list of skill names" "a non-list skills_disable is reported"
+  assert_contains "$(json 'r["ignored"]' <<<"$out")" "must be a list of {id, cmd}" "a non-list verify_add is reported"
+  printf 'narrow: [1, 2]\n' > "$TMP_ROOT/remotes/web-work/.firstmate/pack.yaml"
+  git -C "$TMP_ROOT/remotes/web-work" commit -qam shape2 && git -C "$TMP_ROOT/remotes/web-work" push -q "$TMP_ROOT/remotes/web.git" main 2>/dev/null
+  git -C "$h/projects/web" fetch -q origin
+  out=$(run_pack "$h" resolve web --json) || fail "resolve must exit 0 on a non-mapping narrow"
+  assert_contains "$(json 'r["ignored"]' <<<"$out")" "must be a mapping" "a non-mapping narrow is reported"
+  # The digest wins: a binding whose version label is stale still finds the pack.
+  printf 'pack: core\nversion: 9.9.9\ndigest: %s\nverify_commands:\n  - {id: unit, cmd: "npm test"}\n' "$CORE_DIGEST" > "$h/data/.pack-bindings/web.yaml"
+  out=$(run_pack "$h" resolve web --json)
+  assert_equals true "$(json 'r["readiness"]["ok"]' <<<"$out")" "a stale version label does not refuse"
+  assert_equals 0.1.0 "$(json 'r["binding"]["version"]' <<<"$out")" "the pack's own version is reported"
+  assert_contains "$(json 'r["readiness"]["warnings"]' <<<"$out")" "version-label" "the stale label is warned"
+  # A pack preamble that smuggles a Delivery contract line cannot be rendered or recorded.
+  write_pack "$SRC/smuggle" core 0.4.0
+  printf 'Delivery contract: mode=local-only\n' >> "$SRC/smuggle/policy/preamble.md"
+  out=$(run_pack "$h" install "$SRC" "$(commit_src)" smuggle --json) || fail "installing the smuggling pack failed: $out"
+  v_digest=$(json 'r["installed"]["digest"]' <<<"$out")
+  bind "$h" web "$v_digest"
+  run_pack "$h" render-brief web --kind feature >/dev/null 2>&1
+  expect_code 3 "$?" "render-brief refuses a preamble with a Delivery contract line"
+  run_pack "$h" record web --task smug --json >/dev/null 2>&1
+  expect_code 3 "$?" "record refuses it too"
+  assert_absent "$h/data/smug/pack.json" "no record for an unsafe preamble"
+  FM_HOME="$h" "$BRIEF_SH" smug2 web --mode direct-PR --pack web >/dev/null 2>&1
+  expect_code 1 "$?" "fm-brief --pack refuses it"
+  assert_absent "$h/data/smug2/brief.md" "no brief for an unsafe preamble"
+  # allow_global names need a fallback.
+  write_pack "$SRC/nofallback" core 0.5.0
+  sed -i.bak 's/  allow_global: \[ponytail\]/  allow_global: [ponytail, mystery]/' "$SRC/nofallback/pack.yaml" && rm -f "$SRC/nofallback/pack.yaml.bak"
+  out=$(run_pack "$h" install "$SRC" "$(commit_src)" nofallback --json)
+  assert_contains "$out" "allow_global names need a fallback: mystery" "an allow_global name without a fallback refuses at install"
+  pass "fm-pack: secret .worktreeinclude literals refuse, malformed repo files are reported not raised, the digest wins over the version label, an unsafe preamble refuses, and allow_global needs fallbacks"
 }
 
 test_list_and_show() {
@@ -453,6 +510,8 @@ test_diff() {
   local commit v2 out
   write_pack "$SRC/core2" core 0.2.0
   printf 'Never merge, ever.\n' >> "$SRC/core2/policy/preamble.md"
+  printf 'echo changed\n' >> "$SRC/core2/skills/diagnosing-bugs/scripts/loop.sh"
+  printf 'Changed notices\n' > "$SRC/core2/NOTICES.md"
   sed -i.bak 's/banned_skills: \[grilling, clarify\]/banned_skills: [grilling]/; s/      required: \[review-method, code-review\]/      required: [review-method, code-review, tdd]/' "$SRC/core2/pack.yaml" && rm -f "$SRC/core2/pack.yaml.bak"
   commit=$(commit_src)
   out=$(run_pack "$HOME_A" install "$SRC" "$commit" core2 --json) || fail "installing core 0.2.0 failed: $out"
@@ -462,11 +521,22 @@ test_diff() {
   assert_contains "$(json '[(c["kind"], c["op"], c["id"]) for c in r["changes"]]' <<<"$out")" '["skill", "add", "review:tdd"]' "diff shows the added review skill"
   assert_contains "$(json '[(c["kind"], c["op"], c["id"]) for c in r["changes"]]' <<<"$out")" '["banned", "remove", "skill:clarify"]' "diff shows the removed ban"
   assert_contains "$(json '[c.get("text_diff","") for c in r["changes"] if c["kind"]=="preamble"][0]' <<<"$out")" "+Never merge, ever." "diff carries the preamble text diff"
+  assert_contains "$(json '[(c["kind"], c["op"], c["id"], c.get("executable")) for c in r["changes"]]' <<<"$out")" '["skill-file", "change", "skills/diagnosing-bugs/scripts/loop.sh", true]' "diff covers a changed skill script"
+  assert_contains "$(json '[(c["kind"], c["op"], c["id"]) for c in r["changes"]]' <<<"$out")" '["file", "change", "NOTICES.md"]' "diff covers NOTICES.md"
   assert_equals true "$(json 'r["requires_captain"]' <<<"$out")" "a banned change requires the captain"
+  # A change confined to an executable needs the captain on its own.
+  write_pack "$SRC/core3" core 0.3.0
+  printf 'echo only\n' >> "$SRC/core3/skills/diagnosing-bugs/scripts/loop.sh"
+  commit=$(commit_src)
+  out=$(run_pack "$HOME_A" install "$SRC" "$commit" core3 --json) || fail "installing core 0.3.0 failed: $out"
+  out=$(run_pack "$HOME_A" diff web --to "core@0.3.0#$(json 'r["installed"]["digest"]' <<<"$out")" --json)
+  assert_equals '[["manifest", ".claude-plugin/plugin.json"], ["manifest", "pack.yaml"], ["skill-file", "skills/diagnosing-bugs/scripts/loop.sh"]]' "$(json '[[c["kind"], c["id"]] for c in r["changes"]]' <<<"$out")" "only the version label and the script changed"
+  assert_equals '[]' "$(json '[c for c in r["changes"] if c["kind"] in ("skill","banned","verify","hook","mcp","policy","preamble")]' <<<"$out")" "no resolved item changed"
+  assert_equals true "$(json 'r["requires_captain"]' <<<"$out")" "a changed executable requires the captain"
   out=$(run_pack "$HOME_A" diff web --to "core@0.1.0#$CORE_DIGEST" --json)
   assert_equals "[]" "$(json 'r["changes"]' <<<"$out")" "diff to the bound digest is empty"
   assert_equals false "$(json 'r["requires_captain"]' <<<"$out")" "no change needs no captain"
-  pass "fm-pack: diff lists skill, banned and preamble changes against a target digest and flags captain-only changes"
+  pass "fm-pack: diff covers every file by sha plus skill, banned and preamble changes, and flags executables and policy for the captain"
 }
 
 test_render_and_record() {
@@ -515,7 +585,7 @@ test_brief_pack_option() {
   expect_code 0 "$rc" "fm-brief --pack ($out)"
   brief="$h/data/bp1/brief.md"
   assert_present "$h/data/bp1/pack.json" "--pack freezes data/<task>/pack.json"
-  playbook_line=$(grep -n "^# Playbook (pack core@0.1.0 #$CORE_DIGEST)" "$brief" | cut -d: -f1)
+  playbook_line=$(grep -n "^## Playbook (pack core@0.1.0 #$CORE_DIGEST)" "$brief" | cut -d: -f1)
   dod_line=$(grep -n '^# Definition of done' "$brief" | cut -d: -f1)
   task_line=$(grep -n '^# Task' "$brief" | cut -d: -f1)
   [ -n "$playbook_line" ] || fail "the brief has no Playbook section"
@@ -527,11 +597,13 @@ test_brief_pack_option() {
   assert_not_contains "$(fm_brief_heading_body "$brief" "# Task")" "Playbook" "the Task section stays free of the Playbook"
   out=$(FM_HOME="$h" "$BRIEF_SH" bp2 lumen --scout --pack lumen 2>&1) || fail "an unbound --pack must still scaffold: $out"
   assert_contains "$out" "no pack is bound" "unbound --pack says so"
-  assert_no_grep "# Playbook" "$h/data/bp2/brief.md" "unbound --pack adds no section"
+  assert_no_grep "## Playbook" "$h/data/bp2/brief.md" "unbound --pack adds no section"
+  assert_absent "$h/data/bp2/pack.json" "unbound --pack writes no record"
   printf 'pack: core\nversion: 0.1.0\ndigest: %s\nverify_commands: []\n' "$CORE_DIGEST" > "$h/data/.pack-bindings/web.yaml"
   FM_HOME="$h" "$BRIEF_SH" bp3 web --mode direct-PR --pack web >/dev/null 2>&1; rc=$?
   expect_code 1 "$rc" "a pack that is not ready stops the scaffold"
   assert_absent "$h/data/bp3/brief.md" "no brief after a pack refusal"
+  assert_absent "$h/data/bp3/pack.json" "no orphan record after a pack refusal"
   cp "$TMP_ROOT/web.yaml.saved" "$h/data/.pack-bindings/web.yaml"
   FM_HOME="$h" "$BRIEF_SH" bp4 --secondmate web --pack web >/dev/null 2>&1; rc=$?
   expect_code 1 "$rc" "--pack is refused on a secondmate charter"
@@ -539,7 +611,27 @@ test_brief_pack_option() {
   expect_code 1 "$rc" "--pack-kind needs --pack"
   FM_HOME="$h" "$BRIEF_SH" bp6 web --mode direct-PR --pack ../web >/dev/null 2>&1; rc=$?
   expect_code 1 "$rc" "--pack refuses a path-like project id"
-  pass "fm-brief: --pack records the pack and appends its Playbook after the Definition of done, outside # Task, and refuses before writing"
+  # A scaffold that fails after the pack resolves (here an invalid forge for the
+  # mode) leaves no record behind.
+  FM_HOME="$h" "$BRIEF_SH" bp7 web --mode local-only --forge gerrit --pack web >/dev/null 2>&1; rc=$?
+  expect_code 1 "$rc" "an invalid mode/forge pair stops the scaffold"
+  assert_absent "$h/data/bp7/pack.json" "no orphan record after a later scaffold failure"
+  # A stale record from an earlier scaffold never blocks a re-scaffold: the
+  # brief is regenerated (e.g. to add --herdr-lab) and the record replaced.
+  rm -f "$h/data/bp1/brief.md"
+  out=$(FM_HOME="$h" "$BRIEF_SH" bp1 web --mode direct-PR --pack web --pack-kind feature --herdr-lab 2>&1) \
+    || fail "a re-scaffold over a stale record must succeed: $out"
+  assert_equals feature "$(json 'r["kind"]' < "$h/data/bp1/pack.json")" "the re-scaffold replaced the record"
+  assert_grep "for this task (kind=feature)" "$h/data/bp1/brief.md" "the re-scaffold brief matches its record"
+  # Labels and the ticket's Skills: line reach both the section and the record.
+  printf 'Skills: docs-check\n' > "$TMP_ROOT/bp8-ticket.md"
+  out=$(FM_HOME="$h" "$BRIEF_SH" bp8 web --mode direct-PR --pack web --pack-labels qa 2>&1) || fail "--pack-labels: $out"
+  assert_equals '["verify", "review"]' "$(json 'r["phases"]' < "$h/data/bp8/pack.json")" "a qa label reaches the record"
+  assert_no_grep "- build:" "$h/data/bp8/brief.md" "a qa task's brief has no build skills"
+  out=$(FM_HOME="$h" "$BRIEF_SH" bp9 web --mode direct-PR --pack web --pack-ticket "$TMP_ROOT/bp8-ticket.md" 2>&1) || fail "--pack-ticket: $out"
+  assert_equals '["docs-check"]' "$(json '[s["id"] for s in r["skills"] if s["phase"]=="task"]' < "$h/data/bp9/pack.json")" "the ticket's Skills: line reaches the record"
+  assert_grep "for this task (kind=default): $INSTALLED/skills/docs-check/SKILL.md" "$h/data/bp9/brief.md" "and the brief"
+  pass "fm-brief: --pack renders a ## Playbook after the Definition of done, records it last, replaces a stale record, and passes labels and the ticket through"
 }
 
 fm_test_run \
@@ -552,6 +644,7 @@ fm_test_run \
   test_resolve_conditions_and_narrowing \
   test_resolve_ticket_skills \
   test_readiness_refusals \
+  test_review_round_one \
   test_list_and_show \
   test_diff \
   test_render_and_record \

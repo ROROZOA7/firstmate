@@ -14,10 +14,12 @@
 #   fm-pack.sh diff <project> --to <name>@<version>#<digest> --json
 #   fm-pack.sh render-brief <project> --kind <k> [--harness <h>] [--task <id>]
 #              [--heading-level 1|2|3]
-#   fm-pack.sh render-brief <project> --task <id> --from-record [--heading-level 1|2|3]
+#   fm-pack.sh render-brief <project> (--task <id> --from-record | --from-file <resolve.json>)
+#              [--heading-level 1|2|3] [--require-ready]
 #   fm-pack.sh install <repo> <commit-sha> <path> [--expect-digest sha256:<hex>] --json
 #   fm-pack.sh record <project> --task <id> [--kind <k>] [--harness <h>]
-#              [--labels <a,b,...>] [--start-phase <p>] [--ticket <file|->] [--replace] --json
+#              [--labels <a,b,...>] [--start-phase <p>] [--ticket <file|->]
+#              [--from-file <resolve.json>] [--replace] --json
 #
 # Files (under the active FM_HOME; FM_DATA_OVERRIDE, FM_PROJECTS_OVERRIDE and
 # FM_CONFIG_OVERRIDE are honoured like every other fm-* script):
@@ -59,21 +61,32 @@
 #                 data/<task>/pack.json. An unbound project reports
 #                 binding:null and readiness ok with a note.
 #   diff          what changes for <project> if it were bound to the target
-#                 digest; requires_captain is true when hooks, mcp, settings,
-#                 or banned items change.
+#                 digest: resolved skills, verify commands and banned items,
+#                 plus every file in either tree by per-file sha (with a text
+#                 diff, cut at 64 KB). requires_captain is true when hooks, mcp,
+#                 settings, banned items, policy/ files or any executable
+#                 change, or the risk flags change.
 #   render-brief  the brief's Playbook section as text: preamble, absolute
 #                 installed skill paths per phase, banned items, and the verify
 #                 commands the definition of done adds. --from-record renders
-#                 exactly what data/<task>/pack.json froze. An unbound project
-#                 renders nothing.
+#                 exactly what data/<task>/pack.json froze, --from-file a saved
+#                 resolve. A preamble carrying a "Delivery contract:" line is
+#                 refused (exit 3), as is a pack that is not ready under
+#                 --require-ready. An unbound project renders nothing.
 #   install       supervisor-only: fetch one pinned commit, refuse symlinks,
 #                 submodules, unlicensed vendored skills, non-empty settings,
 #                 an unsupported `requires`, a plugin.json name other than the
 #                 pack name, or a digest other than --expect-digest; then copy
 #                 the tree with modes 644/755 into data/.packs atomically.
 #   record        supervisor-only: freeze the resolve output to
-#                 data/<task>/pack.json, refusing when readiness is not ok or a
-#                 record already exists (--replace overwrites it on purpose).
+#                 data/<task>/pack.json, refusing when readiness is not ok, the
+#                 preamble is unsafe, or a record already exists (--replace
+#                 overwrites it on purpose). --from-file records a saved resolve
+#                 instead, after checking the binding has not changed since.
+#
+# Installed packs are found by name and digest; the version is display only.
+# Any fault in an installed tree (changed bytes, a link, a mode, an unreadable
+# entry) is reported as digest-mismatch with the specific cause in `reason`.
 #
 # Exit codes: read-only commands report refusals inside their JSON and exit 0;
 # install and record exit 3 on a refusal and still print the JSON; 2 is a usage

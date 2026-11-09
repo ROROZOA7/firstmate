@@ -16,7 +16,7 @@
 # PR instead of shipping a new one).
 # Usage: fm-brief.sh <task-id> <repo-name> --mode <no-mistakes|direct-PR|local-only> [--branch-prefix <prefix>] [--base-branch <branch>] [--forge <none|gerrit|forgejo|external> [--shape squash]] [--pr <auto|manual>] [--herdr-lab]
 #        fm-brief.sh <task-id> <repo-name> --scout [--base-branch <branch>] [--herdr-lab]
-#        either crewmate form also takes [--pack <project> [--pack-kind <kind>]]
+#        either crewmate form also takes [--pack <project> [--pack-kind <kind>] [--pack-labels <a,b>] [--pack-ticket <file>]]
 #        fm-brief.sh <task-id> --secondmate {<project>...|--no-projects}
 #   --scout writes the scout contract instead: the deliverable is a report at
 #   data/<task-id>/report.md (no branch, no push, no PR) and the worktree is scratch.
@@ -155,16 +155,20 @@
 # a later scout promotion could not outrank), stops the scaffold before
 # anything is written. Secondmate charters never take it.
 # --pack <project> attaches the project's bound skill pack (bin/fm-pack.sh owns
-# the pack contract) to a ship or scout brief: before the brief is written it
-# freezes the resolved pack to data/<task-id>/pack.json with `fm-pack.sh
-# record`, then appends the `# Playbook` section rendered from that record, so
-# the brief and the record cannot disagree. The section is its own top-level
-# section after the Definition of done and before any home brief additions,
-# never inside `# Task`, so it never reaches the no-mistakes `--intent`.
-# --pack-kind names the task kind used to pick the pack's task skills and
-# defaults to `default`. A project with no pack bound changes nothing; a bound
-# pack whose readiness check refuses stops the scaffold before anything is
-# written. Refused on --secondmate.
+# the pack contract) to a ship or scout brief. Before anything is written, the
+# pack is resolved once and its `## Playbook` section rendered from that
+# resolve; a pack that is not ready, or an unsafe preamble, stops the scaffold
+# there. The section goes after the Definition of done and before any home
+# brief additions, never inside `# Task`, so it never reaches the no-mistakes
+# `--intent`. Only after the brief is written is the same resolve frozen to
+# data/<task-id>/pack.json with `fm-pack.sh record --replace`, so a failed
+# scaffold leaves no record and a re-scaffold (for example to add --herdr-lab)
+# replaces a stale one; if that record cannot be written, the brief just
+# written is removed again. --pack-kind names the task kind that picks the
+# pack's task skills (default `default`); --pack-labels passes the ticket's
+# labels (a `qa` label skips the build phase) and --pack-ticket the ticket body
+# whose `Skills:` line replaces the task skills. A project with no pack bound
+# changes nothing. Refused on --secondmate.
 # Refuses to overwrite an existing brief.
 set -eu
 
@@ -251,6 +255,10 @@ PACK_PROJECT=
 PACK_SET=0
 PACK_KIND=
 PACK_KIND_SET=0
+PACK_LABELS=
+PACK_LABELS_SET=0
+PACK_TICKET=
+PACK_TICKET_SET=0
 POS=()
 want_value=
 for a in "$@"; do
@@ -269,6 +277,8 @@ for a in "$@"; do
       project) PROJECT_DIR=$a; PROJECT_DIR_SET=1 ;;
       pack) PACK_PROJECT=$a; PACK_SET=1 ;;
       pack-kind) PACK_KIND=$a; PACK_KIND_SET=1 ;;
+      pack-labels) PACK_LABELS=$a; PACK_LABELS_SET=1 ;;
+      pack-ticket) PACK_TICKET=$a; PACK_TICKET_SET=1 ;;
       *) echo "error: internal parser state for --$want_value" >&2; exit 1 ;;
     esac
     want_value=
@@ -299,6 +309,10 @@ for a in "$@"; do
     --pack=*) PACK_PROJECT=${a#--pack=}; PACK_SET=1 ;;
     --pack-kind) want_value="pack-kind" ;;
     --pack-kind=*) PACK_KIND=${a#--pack-kind=}; PACK_KIND_SET=1 ;;
+    --pack-labels) want_value="pack-labels" ;;
+    --pack-labels=*) PACK_LABELS=${a#--pack-labels=}; PACK_LABELS_SET=1 ;;
+    --pack-ticket) want_value="pack-ticket" ;;
+    --pack-ticket=*) PACK_TICKET=${a#--pack-ticket=}; PACK_TICKET_SET=1 ;;
     # yolo never reaches the worker: it is firstmate's merge authority, not a
     # brief input. Refuse it loudly so it is never silently dropped here and then
     # believed to have been recorded.
@@ -429,15 +443,24 @@ if [ "$KIND" = secondmate ] && [ "$HERDR_LAB" -eq 1 ]; then
   exit 1
 fi
 
-if [ "$PACK_SET" -eq 1 ] || [ "$PACK_KIND_SET" -eq 1 ]; then
+if [ "$PACK_SET" -eq 1 ] || [ "$PACK_KIND_SET" -eq 1 ] || [ "$PACK_LABELS_SET" -eq 1 ] || [ "$PACK_TICKET_SET" -eq 1 ]; then
   [ "$KIND" != secondmate ] || {
-    echo "error: --pack and --pack-kind apply only to crewmate ship or scout briefs" >&2
+    echo "error: --pack and its --pack-* options apply only to crewmate ship or scout briefs" >&2
     exit 1
   }
   [ "$PACK_SET" -eq 1 ] || {
-    echo "error: --pack-kind requires --pack <project>" >&2
+    echo "error: --pack-kind, --pack-labels and --pack-ticket require --pack <project>" >&2
     exit 1
   }
+  case "$PACK_LABELS" in
+    *[!A-Za-z0-9._,:\ -]*)
+      echo "error: --pack-labels takes comma-separated labels, got '$PACK_LABELS'" >&2
+      exit 1 ;;
+  esac
+  if [ "$PACK_TICKET_SET" -eq 1 ] && [ ! -f "$PACK_TICKET" ]; then
+    echo "error: --pack-ticket must name a readable file, got '$PACK_TICKET'" >&2
+    exit 1
+  fi
   case "$PACK_PROJECT" in
     ''|.|..|*[!A-Za-z0-9._-]*)
       echo "error: --pack takes a project id ([A-Za-z0-9._-]), got '$PACK_PROJECT'" >&2
@@ -484,34 +507,48 @@ append_brief_include() {
 BRIEF="$DATA/$ID/brief.md"
 [ -e "$BRIEF" ] && { echo "error: $BRIEF already exists" >&2; exit 1; }
 
-# The pack is frozen and rendered before the brief exists, so a refusal leaves
-# no partial scaffold; the rendered text is appended after the contract below.
+# The pack is resolved and its section rendered before the brief exists, so a
+# refusal leaves nothing behind; the same resolve is recorded only after the
+# brief is written (record_pack_section below).
 PACK_SECTION=
+PACK_RESOLVE=
 if [ "$PACK_SET" -eq 1 ]; then
-  pack_out=$(FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" FM_CONFIG_OVERRIDE="$CONFIG" \
-    "$SCRIPT_DIR/fm-pack.sh" record "$PACK_PROJECT" --task "$ID" --kind "$PACK_KIND" --json) || {
-    printf '%s\n' "$pack_out" >&2
-    echo "error: --pack $PACK_PROJECT: the pack could not be recorded for this task (refusal above); the brief was not written" >&2
+  PACK_RESOLVE=$(mktemp "${TMPDIR:-/tmp}/fm-brief-pack.XXXXXX")
+  trap 'rm -f "$PACK_RESOLVE"' EXIT
+  pack_args=("$PACK_PROJECT" --kind "$PACK_KIND")
+  [ "$PACK_LABELS_SET" -eq 0 ] || pack_args+=(--labels "$PACK_LABELS")
+  [ "$PACK_TICKET_SET" -eq 0 ] || pack_args+=(--ticket "$PACK_TICKET")
+  FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" FM_CONFIG_OVERRIDE="$CONFIG" \
+    "$SCRIPT_DIR/fm-pack.sh" resolve "${pack_args[@]}" --json > "$PACK_RESOLVE" || {
+    echo "error: --pack $PACK_PROJECT: the pack could not be resolved; the brief was not written" >&2
     exit 1
   }
-  if printf '%s' "$pack_out" | grep -q '"recorded": true'; then
-    PACK_SECTION=$(FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" FM_CONFIG_OVERRIDE="$CONFIG" \
-      "$SCRIPT_DIR/fm-pack.sh" render-brief "$PACK_PROJECT" --task "$ID" --from-record --heading-level 1) || {
-      rm -f "$DATA/$ID/pack.json"
-      echo "error: --pack $PACK_PROJECT: the recorded pack could not be rendered; the brief was not written" >&2
-      exit 1
-    }
-  else
-    echo "note: --pack $PACK_PROJECT: no pack is bound to that project; the brief carries no Playbook section" >&2
-  fi
+  PACK_SECTION=$(FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" FM_CONFIG_OVERRIDE="$CONFIG" \
+    "$SCRIPT_DIR/fm-pack.sh" render-brief "$PACK_PROJECT" --from-file "$PACK_RESOLVE" --task "$ID" \
+    --heading-level 2 --require-ready) || {
+    echo "error: --pack $PACK_PROJECT: the pack is not ready for this task (reason above); the brief was not written" >&2
+    exit 1
+  }
+  [ -n "$PACK_SECTION" ] \
+    || echo "note: --pack $PACK_PROJECT: no pack is bound to that project; the brief carries no Playbook section" >&2
 fi
 mkdir -p "$DATA/$ID"
 
 # Append the pack's Playbook section after the contract and before any home
-# brief additions.
+# brief additions, then freeze the resolve it was rendered from. A record that
+# cannot be written removes the brief this run just wrote, so the two never
+# disagree.
 append_pack_section() {
   [ -n "$PACK_SECTION" ] || return 0
   printf '\n%s\n' "$PACK_SECTION" >> "$BRIEF"
+  local pack_out
+  pack_out=$(FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" FM_CONFIG_OVERRIDE="$CONFIG" \
+    "$SCRIPT_DIR/fm-pack.sh" record "${pack_args[@]}" --task "$ID" --from-file "$PACK_RESOLVE" --replace --json) || {
+    printf '%s\n' "$pack_out" >&2
+    rm -f "$BRIEF"
+    echo "error: --pack $PACK_PROJECT: the pack record could not be written (refusal above); the brief was removed" >&2
+    exit 1
+  }
 }
 
 ASK_USER_BLOCK=

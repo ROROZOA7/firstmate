@@ -38,6 +38,7 @@ MAX_TREE_ENTRIES = 4096
 MAX_TREE_BYTES = 64 * 1024 * 1024
 MAX_YAML_BYTES = 1024 * 1024
 TEXT_DIFF_LIMIT = 64 * 1024
+SECRET_GLOBS = [".env*", "*.pem", "*.key", "credentials*"]
 SECRET_SAMPLES = [".env", ".env.local", ".env.production", "server.pem", "id_rsa.key", "credentials", "credentials.json"]
 
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -52,13 +53,17 @@ FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 
 
 class Refusal(Exception):
-    def __init__(self, code, detail=""):
+    def __init__(self, code, detail="", reason=None):
         super().__init__(f"{code}: {detail}")
         self.code = code
         self.detail = detail
+        self.reason = reason
 
     def as_dict(self):
-        return {"code": self.code, "detail": self.detail}
+        out = {"code": self.code, "detail": self.detail}
+        if self.reason is not None:
+            out["reason"] = self.reason
+        return out
 
 
 class UsageError(Exception):
@@ -160,6 +165,8 @@ def _hash_checked(full, rel, checked):
 def tree_digest(root, installed=False):
     """Return (digest, files) for a pack tree, refusing anything the contract forbids.
 
+    files maps each relative path to (mode, sha256hex).
+
     mode is normalised (755 when any execute bit is set, else 644); lines
     "<mode> <sha256hex> <relpath>\\n" are sorted by code point and hashed.
     installed=True additionally requires the exact modes install writes.
@@ -174,7 +181,7 @@ def tree_digest(root, installed=False):
 
 def _tree_digest(root, installed):
     lines = []
-    files = []
+    files = {}
     entries = 0
     total = 0
     # A trailing slash makes lstat follow a symlinked root, so strip it first.
@@ -216,12 +223,12 @@ def _tree_digest(root, installed):
                 raise Refusal("pack-oversized", f"more than {MAX_TREE_BYTES} bytes")
             sha = _hash_checked(full, rel, st)
             lines.append(f"{mode} {sha} {rel}\n")
-            files.append(rel)
+            files[rel] = (mode, sha)
         if entries > MAX_TREE_ENTRIES:
             raise Refusal("pack-oversized", f"more than {MAX_TREE_ENTRIES} entries")
     lines.sort()
     digest = "sha256:" + hashlib.sha256("".join(lines).encode("utf-8")).hexdigest()
-    return digest, sorted(files)
+    return digest, dict(sorted(files.items()))
 
 
 # --- YAML and manifest validation ---------------------------------------------
@@ -352,6 +359,10 @@ def load_manifest(root):
         verify.append({"id": _str(vc.get("id"), "verify id", "manifest-invalid"), "cmd": _str(vc.get("cmd"), "verify cmd", "manifest-invalid")})
     harnesses = [_str(h, "harnesses", "manifest-invalid") for h in _list(m.get("harnesses"), "harnesses", "manifest-invalid")] or list(DEFAULT_HARNESSES)
     preamble = _inside(root, m.get("preamble"), "preamble") if m.get("preamble") is not None else None
+    allow_global = set(_skill_list(skills.get("allow_global"), "allow_global"))
+    unbacked = sorted(allow_global - set(fallbacks))
+    if unbacked:
+        raise Refusal("manifest-invalid", f"allow_global names need a fallback: {', '.join(unbacked)}")
     return {
         "raw": m,
         "name": name,
@@ -360,7 +371,7 @@ def load_manifest(root):
         "harnesses": harnesses,
         "vendored": vendored,
         "vendored_ids": set(vendored_ids),
-        "allow_global": set(_skill_list(skills.get("allow_global"), "allow_global")),
+        "allow_global": allow_global,
         "aliases": aliases,
         "by_kind": by_kind,
         "default": default,
@@ -415,22 +426,52 @@ def installed_packs(home):
                     yield name, version, "sha256:" + entry, ddir
 
 
+_VERIFIED = {}
+
+
 def find_pack(home, name, version, digest):
-    """Locate an installed pack and verify it. Raises Refusal."""
-    if not PACK_NAME_RE.match(name or "") or not VERSION_RE.match(version or "") or not DIGEST_RE.match(digest or ""):
+    """Locate an installed pack by name and digest, verify it, and return (path, manifest, files).
+
+    The digest wins: version is display only, so the pack is found in whichever
+    version directory holds that digest, and the manifest's own version is
+    reported. Anything wrong with an installed tree - a changed byte, a link, a
+    mode, an unreadable entry - is reported as digest-mismatch, with the
+    specific cause in `reason`. Verified packs are cached per process.
+    """
+    if not PACK_NAME_RE.match(name or "") or not DIGEST_RE.match(digest or ""):
         raise Refusal("pack-not-installed", f"invalid pack reference {name}@{version}#{digest}")
-    path = home.pack_dir(name, version, digest)
-    if os.path.islink(path):
-        raise Refusal("link-unsafe", f"{name}@{version}#{digest}: the installed pack directory is a symbolic link")
-    if not os.path.isdir(path):
-        raise Refusal("pack-not-installed", f"{name}@{version}#{digest} is not installed under data/.packs")
-    actual, _ = tree_digest(path, installed=True)
+    key = (home.packs, name, digest)
+    if key in _VERIFIED:
+        return _VERIFIED[key]
+    hexd = digest.split(":", 1)[1]
+    ndir = os.path.join(home.packs, name)
+    candidates = []
+    if os.path.isdir(ndir) and not os.path.islink(ndir):
+        for ver in sorted(os.listdir(ndir)):
+            path = os.path.join(ndir, ver, hexd)
+            if VERSION_RE.match(ver) and os.path.lexists(path):
+                candidates.append(path)
+    if not candidates:
+        raise Refusal("pack-not-installed", f"{name}#{digest} is not installed under data/.packs")
+    if len(candidates) > 1:
+        raise Refusal("digest-mismatch", f"{name}#{digest} is installed under more than one version directory",
+                      reason="duplicate-install")
+    path = candidates[0]
+    try:
+        actual, files = tree_digest(path, installed=True)
+    except Refusal as exc:
+        raise Refusal("digest-mismatch", f"installed tree {name}#{digest}: {exc.detail}", reason=exc.code) from None
     if actual != digest:
-        raise Refusal("digest-mismatch", f"installed tree hashes to {actual}, not {digest}")
-    manifest = load_manifest(path)
-    if manifest["name"] != name or manifest["version"] != version:
-        raise Refusal("digest-mismatch", f"manifest says {manifest['name']}@{manifest['version']}, directory says {name}@{version}")
-    return path, manifest
+        raise Refusal("digest-mismatch", f"installed tree hashes to {actual}, not {digest}", reason="content-changed")
+    try:
+        manifest = load_manifest(path)
+    except Refusal as exc:
+        raise Refusal("digest-mismatch", f"installed manifest: {exc.detail}", reason=exc.code) from None
+    if manifest["name"] != name or os.path.basename(os.path.dirname(path)) != manifest["version"]:
+        raise Refusal("digest-mismatch", f"manifest says {manifest['name']}@{manifest['version']}, directory says "
+                      f"{name}@{os.path.basename(os.path.dirname(path))}", reason="manifest-mismatch")
+    _VERIFIED[key] = (path, manifest, files)
+    return _VERIFIED[key]
 
 
 def read_install_record(home, name, version, digest):
@@ -527,18 +568,22 @@ def all_bindings(home):
 class Repo:
     """Read-only view of a project's origin/<default> tree."""
 
-    def __init__(self, path):
+    def __init__(self, path, bin_dir):
         self.path = path
         self.ref = None
         self.files = None
         if not os.path.isdir(os.path.join(path, ".git")) and not os.path.isfile(os.path.join(path, ".git")):
             return
-        head = self._git("symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
-        candidates = [head] if head else ["origin/main", "origin/master"]
-        for ref in candidates:
-            if ref and self._git("rev-parse", "--verify", "--quiet", ref + "^{commit}"):
-                self.ref = ref
-                break
+        # The default branch name comes from the shared helper
+        # (bin/fm-tangle-lib.sh fm_default_branch); only origin's copy is read.
+        try:
+            res = subprocess.run(["bash", "-c", '. "$1/fm-tangle-lib.sh" && fm_default_branch "$2"', "fm-pack",
+                                  bin_dir, path], capture_output=True, timeout=30, check=False)
+            branch = res.stdout.decode("utf-8", "replace").strip() if res.returncode == 0 else ""
+        except (OSError, subprocess.TimeoutExpired):
+            branch = ""
+        if branch and self._git("rev-parse", "--verify", "--quiet", f"origin/{branch}^{{commit}}"):
+            self.ref = f"origin/{branch}"
         if self.ref:
             listing = self._git("ls-tree", "-r", "-z", "--name-only", self.ref, raw=True)
             self.files = [f for f in (listing or "").split("\0") if f]
@@ -589,6 +634,11 @@ def worktreeinclude_secret(repo):
             pat = pat[3:]
         pat = pat.lstrip("/")
         base = pat.rsplit("/", 1)[-1]
+        # A literal entry (config/master.key) is itself a name a secret glob
+        # matches; a pattern entry (*.env*) is one that would sweep up a
+        # typical secret file name.
+        if any(fnmatch.fnmatchcase(base, g) for g in SECRET_GLOBS):
+            return line.strip()
         for sample in SECRET_SAMPLES:
             if fnmatch.fnmatchcase(sample, base) or fnmatch.fnmatchcase(sample, pat):
                 return line.strip()
@@ -602,23 +652,45 @@ def parse_repo_narrowing(repo):
     if text is None:
         return [], [], ignored
     try:
-        value = yaml.safe_load(text) if len(text) <= MAX_YAML_BYTES else None
-    except yaml.YAMLError as exc:
+        if len(text) > MAX_YAML_BYTES:
+            return [], [], [{"item": ".firstmate/pack.yaml", "reason": f"larger than {MAX_YAML_BYTES} bytes"}]
+        value = yaml.safe_load(text)
+    except (yaml.YAMLError, ValueError, TypeError, RecursionError) as exc:
         return [], [], [{"item": ".firstmate/pack.yaml", "reason": f"unparseable: {exc}"}]
+    if value is None:
+        return [], [], ignored
     if not isinstance(value, dict):
         return [], [], [{"item": ".firstmate/pack.yaml", "reason": "not a mapping"}]
-    for key in sorted(set(value) - {"narrow"}):
+    for key in sorted((str(k) for k in value if k != "narrow"), key=str):
         ignored.append({"item": key, "reason": "repo files may only narrow"})
-    narrow = value.get("narrow") if isinstance(value.get("narrow"), dict) else {}
-    for key in sorted(set(narrow) - {"skills_disable", "verify_add"}):
+    narrow = value.get("narrow")
+    if narrow is None:
+        narrow = {}
+    if not isinstance(narrow, dict):
+        ignored.append({"item": "narrow", "reason": "must be a mapping"})
+        narrow = {}
+    for key in sorted(str(k) for k in narrow if k not in ("skills_disable", "verify_add")):
         ignored.append({"item": f"narrow.{key}", "reason": "repo files may only narrow"})
-    disable = [s for s in (narrow.get("skills_disable") or []) if isinstance(s, str) and SKILL_RE.match(s)]
+    disable = []
+    raw_disable = narrow.get("skills_disable")
+    if raw_disable is not None and not isinstance(raw_disable, list):
+        ignored.append({"item": "narrow.skills_disable", "reason": "must be a list of skill names"})
+        raw_disable = []
+    for item in raw_disable or []:
+        if isinstance(item, str) and SKILL_RE.match(item):
+            disable.append(item)
+        else:
+            ignored.append({"item": f"narrow.skills_disable {item!r}"[:200], "reason": "not a skill name"})
     verify = []
-    for vc in narrow.get("verify_add") or []:
+    raw_verify = narrow.get("verify_add")
+    if raw_verify is not None and not isinstance(raw_verify, list):
+        ignored.append({"item": "narrow.verify_add", "reason": "must be a list of {id, cmd}"})
+        raw_verify = []
+    for vc in raw_verify or []:
         if isinstance(vc, dict) and isinstance(vc.get("id"), str) and isinstance(vc.get("cmd"), str) and vc["id"] and vc["cmd"]:
             verify.append({"id": vc["id"], "cmd": vc["cmd"]})
         else:
-            ignored.append({"item": f"narrow.verify_add {vc!r}", "reason": "needs {id, cmd}"})
+            ignored.append({"item": f"narrow.verify_add {vc!r}"[:200], "reason": "needs {id, cmd}"})
     return disable, verify, ignored
 
 
@@ -717,7 +789,7 @@ def resolve(home, project, kind=None, harness=None, task=None, labels=None, star
         out["harness"] = harness
     out.update({"binding": None, "skills": [], "banned": [], "hooks": [], "mcp": [], "settings_keys": [],
                 "verify_commands": [], "preamble": None, "model_hint": {"value": None, "owner": "dispatch"},
-                "evidence": None, "project_settings": project_settings(home, project), "ignored": [],
+                "evidence": None, "project_settings": None, "ignored": [],
                 "readiness": {"ok": True, "missing": [], "warnings": [], "refusals": []}})
     if kind is not None:
         out["kind"] = kind
@@ -744,6 +816,7 @@ def resolve(home, project, kind=None, harness=None, task=None, labels=None, star
         return out
     out["binding"] = {"pack": binding["pack"], "version": binding["version"], "digest": binding["digest"],
                       "binding_digest": binding.get("binding_digest")}
+    out["project_settings"] = project_settings(home, project)
     if task is not None:
         rec = read_task_record(home, task)
         if rec and isinstance(rec.get("binding"), dict):
@@ -751,11 +824,14 @@ def resolve(home, project, kind=None, harness=None, task=None, labels=None, star
             out["recorded_pack"] = f"{rb.get('pack')}@{rb.get('version')}#{rb.get('digest')}"
             out["drift"] = rb.get("digest") != binding["digest"] or rb.get("binding_digest") != binding.get("binding_digest")
     try:
-        root, manifest = find_pack(home, binding["pack"], binding["version"], binding["digest"])
+        root, manifest, _files = find_pack(home, binding["pack"], binding["version"], binding["digest"])
     except Refusal as exc:
-        refuse(exc.code, exc.detail)
+        readiness["refusals"].append(exc.as_dict())
         readiness["ok"] = False
         return out
+    if manifest["version"] != binding["version"]:
+        warn("version-label", f"the binding says {binding['version']}; the pack at that digest is {manifest['version']} (the digest wins)")
+        out["binding"]["version"] = manifest["version"]
 
     harnesses = manifest["harnesses"]
     if harness is not None and harness not in harnesses:
@@ -766,7 +842,7 @@ def resolve(home, project, kind=None, harness=None, task=None, labels=None, star
             return value
         return {h: value for h in harnesses}
 
-    repo = Repo(os.path.join(home.projects, project))
+    repo = Repo(os.path.join(home.projects, project), home.bin)
     if not repo.available:
         warn("project-clone-missing", "conditions, repo narrowing and .worktreeinclude were not read")
     repo_disable, repo_verify, repo_ignored = parse_repo_narrowing(repo)
@@ -1001,7 +1077,10 @@ def render_brief(r, heading_level=2, task_dir=None):
     pre = r.get("preamble") or {}
     if pre.get("path"):
         with open(pre["path"], "r", encoding="utf-8") as fh:
-            lines += [shift_headings(fh.read().rstrip("\n"), heading_level), ""]
+            text = fh.read()
+        if re.search(r"^\s*Delivery contract:", text, re.M):
+            raise Refusal("preamble-unsafe", "the pack preamble carries a 'Delivery contract:' line; the delivery mode is a per-task decision")
+        lines += [shift_headings(text.rstrip("\n"), heading_level), ""]
     lines.append("Skills - read and follow before the matching step (absolute paths):")
     kind = r.get("kind") or "default"
     for phase in ["build", "task", "verify", "review"]:
@@ -1078,7 +1157,7 @@ def diff(home, project, to_ref):
         out["refusals"].append(exc.as_dict())
         return out
     try:
-        to_root, to_manifest = find_pack(home, name, version, digest)
+        to_root, to_manifest, to_files = find_pack(home, name, version, digest)
     except Refusal as exc:
         out["refusals"].append(exc.as_dict())
         return out
@@ -1102,13 +1181,9 @@ def diff(home, project, to_ref):
         elif b and not a:
             changes.append({"kind": "skill", "op": "add", "id": key, "after": {f: b.get(f) for f in fields}})
         else:
-            td = _text_diff(a.get("path"), b.get("path"), f"skills/{a['id']}/SKILL.md") if (a.get("path") or b.get("path")) else None
-            if any(a.get(f) != b.get(f) for f in fields) or td:
-                change = {"kind": "skill", "op": "change", "id": key,
-                          "before": {f: a.get(f) for f in fields}, "after": {f: b.get(f) for f in fields}}
-                if td:
-                    change["text_diff"] = td
-                changes.append(change)
+            if any(a.get(f) != b.get(f) for f in fields):
+                changes.append({"kind": "skill", "op": "change", "id": key,
+                                "before": {f: a.get(f) for f in fields}, "after": {f: b.get(f) for f in fields}})
     for kind, field, key in (("verify", "verify_commands", "id"), ("banned", "banned", "id"),
                              ("hook", "hooks", "id"), ("mcp", "mcp", "id")):
         bmap = {f"{x.get('kind', '')}:{x[key]}" if kind == "banned" else x[key]: x for x in before.get(field, [])}
@@ -1122,23 +1197,53 @@ def diff(home, project, to_ref):
                 changes.append({"kind": kind, "op": "add", "id": k, "after": strip(y)})
             elif strip(x) != strip(y):
                 changes.append({"kind": kind, "op": "change", "id": k, "before": strip(x), "after": strip(y)})
-    bp = (before.get("preamble") or {}).get("path")
-    ap = (after.get("preamble") or {}).get("path")
-    td = _text_diff(bp, ap, "policy/preamble.md")
-    if td:
-        changes.append({"kind": "preamble", "op": "change" if bp and ap else ("add" if ap else "remove"), "id": "preamble", "text_diff": td})
+    # Every file in either tree, by per-file sha: SKILL.md text, scripts,
+    # references, fallbacks, NOTICES.md and plugin.json all count.
+    from_root, from_files = None, {}
     before_risk = set()
     if current:
         try:
-            r_root, r_manifest = find_pack(home, current["pack"], current["version"], current["digest"])
-            before_risk = set(pack_risk(r_root, r_manifest))
-        except Refusal:
-            pass
+            from_root, from_manifest, from_files = find_pack(home, current["pack"], current["version"], current["digest"])
+            before_risk = set(pack_risk(from_root, from_manifest))
+        except Refusal as exc:
+            out["refusals"].append(dict(exc.as_dict(), side="from"))
+    for rel in sorted(set(from_files) | set(to_files)):
+        a, b = from_files.get(rel), to_files.get(rel)
+        if a == b:
+            continue
+        op = "add" if a is None else "remove" if b is None else "change"
+        change = {"kind": _file_kind(rel), "op": op, "id": rel,
+                  "before": {"mode": a[0], "sha256": a[1]} if a else None,
+                  "after": {"mode": b[0], "sha256": b[1]} if b else None}
+        td = _text_diff(os.path.join(from_root, *rel.split("/")) if a else None,
+                        os.path.join(to_root, *rel.split("/")) if b else None, rel)
+        if td:
+            change["text_diff"] = td
+        if (a and a[0] == "755") or (b and b[0] == "755"):
+            change["executable"] = True
+        changes.append(change)
     after_risk = set(pack_risk(to_root, to_manifest))
     out["risk_changes"] = ([{"op": "add", "risk": r} for r in sorted(after_risk - before_risk)]
                            + [{"op": "remove", "risk": r} for r in sorted(before_risk - after_risk)])
-    out["requires_captain"] = any(c["kind"] in ("hook", "mcp", "setting", "banned") for c in changes)
+    out["requires_captain"] = any(
+        c["kind"] in ("hook", "mcp", "setting", "banned", "policy", "preamble") or c.get("executable")
+        for c in changes) or bool(out["risk_changes"])
     return out
+
+
+def _file_kind(rel):
+    """The change kind for one pack file."""
+    if rel == "policy/preamble.md":
+        return "preamble"
+    if rel.startswith("policy/"):
+        return "policy"
+    if rel.startswith("skills/"):
+        return "skill-file"
+    if rel in ("pack.yaml", ".claude-plugin/plugin.json"):
+        return "manifest"
+    if rel.startswith("hooks/"):
+        return "hook"
+    return "file"
 
 
 # --- list / show -----------------------------------------------------------------
@@ -1157,7 +1262,7 @@ def list_packs(home):
             entry["source"] = {k: rec["source"].get(k) for k in ("repo", "commit", "path")}
         entry["installed_at"] = rec.get("installed_at")
         try:
-            _, manifest = find_pack(home, name, version, digest)
+            _, manifest, _files = find_pack(home, name, version, digest)
             entry["contents"] = {"skills": len(manifest["vendored"]), "hooks": len(manifest["hooks"]), "mcp": len(manifest["mcp"])}
             entry["risk"] = pack_risk(path, manifest)
             entry["description"] = manifest["description"]
@@ -1182,13 +1287,12 @@ def show_pack(home, ref):
     n, v, d, path = candidates[0]
     out.update({"name": n, "version": v, "digest": d, "path": path})
     try:
-        _, manifest = find_pack(home, n, v, d)
+        _, manifest, files = find_pack(home, n, v, d)
     except Refusal as exc:
         out["refusals"].append(exc.as_dict())
         return out
-    _, files = tree_digest(path, installed=True)
     out["manifest"] = manifest["raw"]
-    out["files"] = files
+    out["files"] = list(files)
     out["notices"] = _read_text(os.path.join(path, "NOTICES.md"))
     out["source"] = read_install_record(home, n, v, d).get("source")
     return out
@@ -1288,14 +1392,32 @@ def install(home, repo_url, commit, subpath, expect_digest=None):
         shutil.rmtree(work, ignore_errors=True)
 
 
-def record(home, project, task, replace=False, **kwargs):
+def record(home, project, task, replace=False, from_file=None, **kwargs):
+    """Freeze a resolve to data/<task>/pack.json.
+
+    from_file records an already-rendered resolve (fm-brief.sh renders first,
+    then records last) after checking it is the same binding and readiness
+    still holds; otherwise resolve runs here.
+    """
     if not TASK_RE.match(task or ""):
         raise UsageError(f"invalid task id {task!r}")
     r = resolve(home, project, **kwargs)
+    if from_file is not None:
+        try:
+            with open(from_file, "rb") as fh:
+                frozen = json.loads(fh.read().decode("utf-8"))
+        except (OSError, ValueError) as exc:
+            raise UsageError(f"--from-file: {exc}") from None
+        if not isinstance(frozen, dict) or frozen.get("schema") != SCHEMA or frozen.get("project") != project:
+            raise UsageError("--from-file is not a resolve of this project")
+        if frozen.get("binding") != r.get("binding"):
+            raise Refusal("binding-changed", "the binding changed between render and record")
+        r = frozen
     if r["binding"] is None:
         return {"recorded": False, "note": "no pack bound", "path": None}, r
     if not r["readiness"]["ok"]:
         raise Refusal("not-ready", "; ".join(f"{x['code']}: {x['detail']}" for x in r["readiness"]["refusals"]))
+    render_brief(r)  # refuses an unsafe preamble before anything is written
     tdir = os.path.join(home.data, task)
     os.makedirs(tdir, exist_ok=True)
     target = os.path.join(tdir, "pack.json")
@@ -1318,13 +1440,15 @@ USAGE = """usage: fm-pack.sh version --json
        fm-pack.sh resolve <project> [--task <id>] [--harness <h>] [--kind <k>] [--labels <a,b>]
                   [--start-phase <build|verify|review>] [--ticket <file|->] --json
        fm-pack.sh diff <project> --to <name>@<version>#<digest> --json
-       fm-pack.sh render-brief <project> --kind <k> [--harness <h>] [--task <id>] [--from-record] [--heading-level <1-3>]
+       fm-pack.sh render-brief <project> --kind <k> [--harness <h>] [--task <id>] [--heading-level <1-3>]
+       fm-pack.sh render-brief <project> (--task <id> --from-record | --from-file <resolve.json>) [--heading-level <1-3>]
        fm-pack.sh install <repo> <commit> <path> [--expect-digest <sha256:...>] --json
-       fm-pack.sh record <project> --task <id> [--kind <k>] [--harness <h>] [--replace] --json"""
+       fm-pack.sh record <project> --task <id> [--kind <k>] [--harness <h>] [--labels <a,b>] [--start-phase <p>]
+                  [--ticket <file|->] [--from-file <resolve.json>] [--replace] --json"""
 
 VALUE_FLAGS = {"--task", "--harness", "--kind", "--labels", "--start-phase", "--ticket", "--to",
-               "--heading-level", "--expect-digest"}
-BOOL_FLAGS = {"--json", "--from-record", "--replace"}
+               "--heading-level", "--expect-digest", "--from-file"}
+BOOL_FLAGS = {"--json", "--from-record", "--replace", "--require-ready"}
 
 
 def parse_args(argv):
@@ -1406,20 +1530,38 @@ def main(argv):
             raise UsageError("--heading-level must be 1, 2 or 3")
         level = int(level_text)
         task = opts.get("--task")
-        if opts.get("--from-record"):
-            if not task:
-                raise UsageError("--from-record needs --task <id>")
-            r = read_task_record(home, task)
-            if r is None:
-                raise UsageError(f"no readable record at data/{task}/pack.json")
+        if opts.get("--from-record") or "--from-file" in opts:
+            if opts.get("--from-record"):
+                if not task:
+                    raise UsageError("--from-record needs --task <id>")
+                r = read_task_record(home, task)
+                source = f"data/{task}/pack.json"
+            else:
+                try:
+                    with open(opts["--from-file"], "rb") as fh:
+                        r = json.loads(fh.read().decode("utf-8"))
+                except (OSError, ValueError):
+                    r = None
+                source = opts["--from-file"]
+            if not isinstance(r, dict):
+                raise UsageError(f"no readable resolve record at {source}")
             if r.get("project") != pos[0]:
-                raise UsageError(f"data/{task}/pack.json records project {r.get('project')!r}, not {pos[0]!r}")
+                raise UsageError(f"{source} records project {r.get('project')!r}, not {pos[0]!r}")
         else:
             if "--kind" not in opts:
                 raise UsageError("render-brief needs --kind <k>")
             r = resolve(home, pos[0], **resolve_kwargs(opts))
         task_dir = os.path.join(home.data, task) if task else None
-        sys.stdout.write(render_brief(r, level, task_dir))
+        if opts.get("--require-ready") and r.get("binding") and not (r.get("readiness") or {}).get("ok"):
+            sys.stderr.write("fm-pack: render-brief refused: the pack is not ready: "
+                             + "; ".join(f"{x.get('code')}: {x.get('detail')}" for x in r["readiness"].get("refusals", [])) + "\n")
+            return 3
+        try:
+            text = render_brief(r, level, task_dir)
+        except Refusal as exc:
+            sys.stderr.write(f"fm-pack: render-brief refused: {exc.code}: {exc.detail}\n")
+            return 3
+        sys.stdout.write(text)
         return 0
     if verb == "install":
         need(pos, 3, verb)
@@ -1436,7 +1578,8 @@ def main(argv):
             raise UsageError("record needs --task <id>")
         kwargs = resolve_kwargs(opts)
         try:
-            result, _r = record(home, pos[0], opts["--task"], replace=bool(opts.get("--replace")), **kwargs)
+            result, _r = record(home, pos[0], opts["--task"], replace=bool(opts.get("--replace")),
+                                from_file=opts.get("--from-file"), **kwargs)
         except Refusal as exc:
             emit(envelope(home, recorded=False, refusals=[exc.as_dict()]))
             return 3
