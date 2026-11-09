@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import difflib
+import errno
 import fnmatch
 import hashlib
 import json
@@ -105,12 +106,55 @@ def emit(obj):
 # --- tree digest (contracts section 1) ---------------------------------------
 
 def _safe_rel(rel):
+    """Refuse names the digest lines cannot carry: newline, CR, backslash, non-UTF-8.
+
+    os.walk decodes undecodable bytes as surrogate escapes, which a strict
+    UTF-8 encode rejects.
+    """
     if "\n" in rel or "\r" in rel or "\\" in rel:
         raise Refusal("path-unsafe", f"unsupported character in path: {rel!r}")
     try:
-        rel.encode("utf-8")
+        rel.encode("utf-8", errors="strict")
     except UnicodeEncodeError:
-        raise Refusal("path-unsafe", f"path is not UTF-8: {rel!r}") from None
+        raise Refusal("path-unsafe", f"path is not valid UTF-8: {rel!r}") from None
+
+
+def _walk_error(exc):
+    raise Refusal("tree-unreadable", f"cannot read {exc.filename}: {exc.strerror}")
+
+
+def _hash_checked(full, rel, checked):
+    """Hash one file through an O_NOFOLLOW descriptor, re-checking what lstat saw.
+
+    The fstat of the open descriptor must still be a regular file with one link
+    and the size lstat reported; at most that many bytes are read, and a file
+    that changed while it was read is refused rather than half-hashed.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(full, flags)
+    except OSError as exc:
+        code = "link-unsafe" if exc.errno == errno.ELOOP else "tree-unreadable"
+        raise Refusal(code, f"cannot open {rel}: {exc.strerror}") from None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            raise Refusal("link-unsafe", f"changed to a non-plain file while hashing: {rel}")
+        if (st.st_dev, st.st_ino, st.st_size) != (checked.st_dev, checked.st_ino, checked.st_size):
+            raise Refusal("tree-changed", f"changed while hashing: {rel}")
+        h = hashlib.sha256()
+        remaining = st.st_size
+        while remaining > 0:
+            chunk = os.read(fd, min(1024 * 1024, remaining))
+            if not chunk:
+                raise Refusal("tree-changed", f"shrank while hashing: {rel}")
+            h.update(chunk)
+            remaining -= len(chunk)
+        if os.read(fd, 1):
+            raise Refusal("tree-changed", f"grew while hashing: {rel}")
+        return h.hexdigest()
+    finally:
+        os.close(fd)
 
 
 def tree_digest(root, installed=False):
@@ -119,7 +163,16 @@ def tree_digest(root, installed=False):
     mode is normalised (755 when any execute bit is set, else 644); lines
     "<mode> <sha256hex> <relpath>\\n" are sorted by code point and hashed.
     installed=True additionally requires the exact modes install writes.
+    An unreadable directory or entry refuses (tree-unreadable); nothing is
+    skipped.
     """
+    try:
+        return _tree_digest(root, installed)
+    except OSError as exc:
+        raise Refusal("tree-unreadable", f"{exc.filename or root}: {exc.strerror}") from None
+
+
+def _tree_digest(root, installed):
     lines = []
     files = []
     entries = 0
@@ -127,7 +180,7 @@ def tree_digest(root, installed=False):
     root_st = os.lstat(root)
     if stat.S_ISLNK(root_st.st_mode) or not stat.S_ISDIR(root_st.st_mode):
         raise Refusal("link-unsafe", "pack root is not a plain directory")
-    for dirpath, dirnames, filenames in os.walk(root):
+    for dirpath, dirnames, filenames in os.walk(root, onerror=_walk_error, followlinks=False):
         dirnames.sort()
         for name in list(dirnames):
             full = os.path.join(dirpath, name)
@@ -159,11 +212,7 @@ def tree_digest(root, installed=False):
             total += st.st_size
             if total > MAX_TREE_BYTES:
                 raise Refusal("pack-oversized", f"more than {MAX_TREE_BYTES} bytes")
-            h = hashlib.sha256()
-            with open(full, "rb") as fh:
-                for chunk in iter(lambda: fh.read(1024 * 1024), b""):
-                    h.update(chunk)
-            sha = h.hexdigest()
+            sha = _hash_checked(full, rel, st)
             lines.append(f"{mode} {sha} {rel}\n")
             files.append(rel)
         if entries > MAX_TREE_ENTRIES:

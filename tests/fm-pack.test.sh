@@ -239,6 +239,50 @@ test_install_refusals() {
   pass "fm-pack: install refuses symlinks, a wrong digest, missing licences or skills, settings, plugin-name and requires mismatches, and leaves nothing behind"
 }
 
+test_tree_walk_refusals() {
+  local h pack out name
+  # Names a digest line cannot carry refuse at install: git stores them, so
+  # they come from a real commit.
+  write_pack "$SRC/newline" core 0.1.0
+  printf 'x\n' > "$SRC/newline/skills/tdd/bad"$'\n'"name.md"
+  out=$(run_pack "$(new_home nl)" install "$SRC" "$(commit_src)" newline --json)
+  assert_contains "$out" '"code": "path-unsafe"' "a newline in a file name refuses"
+  git -C "$SRC" rm -rq --cached newline && rm -rf "$SRC/newline"
+  if name=$(printf 'bad-\377.md') && (: > "$SRC/core/$name") 2>/dev/null; then
+    rm -f "$SRC/core/$name"
+    write_pack "$SRC/latin1" core 0.1.0
+    : > "$SRC/latin1/skills/tdd/$name"
+    out=$(run_pack "$(new_home latin1)" install "$SRC" "$(commit_src)" latin1 --json)
+    assert_contains "$out" '"code": "path-unsafe"' "a non-UTF-8 file name refuses"
+    git -C "$SRC" rm -rq --cached latin1 && rm -rf "$SRC/latin1"
+    commit_src >/dev/null
+  fi
+  # An installed tree that can no longer be read refuses instead of skipping
+  # the unreadable part (which would hash to a different, plausible digest).
+  h=$(new_home unreadable)
+  run_pack "$h" install "$SRC" "$CORE_COMMIT" core --json >/dev/null
+  bind "$h" web "$CORE_DIGEST"
+  pack="$h/data/.packs/core/0.1.0/${CORE_DIGEST#sha256:}"
+  chmod 000 "$pack/skills/vitest"
+  if [ -r "$pack/skills/vitest" ]; then
+    chmod 755 "$pack/skills/vitest"
+    pass "fm-pack: tree walk refuses newline and non-UTF-8 names (unreadable-dir case skipped: running as a user who bypasses permissions)"
+    return
+  fi
+  out=$(run_pack "$h" resolve web --json); local rc=$?
+  chmod 755 "$pack/skills/vitest"
+  expect_code 0 "$rc" "resolve reports an unreadable tree as data"
+  # The installed-mode check sees the 000 directory before the walk tries to
+  # list it, so either refusal proves the tree was refused rather than skipped.
+  case "$(json '[x["code"] for x in r["readiness"]["refusals"]]' <<<"$out")" in
+    *'"tree-unreadable"'*|*'"mode-unsafe"'*) ;;
+    *) fail "an unreadable directory must refuse, got: $(json 'r["readiness"]' <<<"$out")" ;;
+  esac
+  assert_equals 0 "$(json 'len([s for s in r["skills"] if s["id"]=="vitest" and s.get("path")])' <<<"$out")" "a refused tree lists no skill paths"
+  assert_equals false "$(json 'r["readiness"]["ok"]' <<<"$out")" "an unreadable tree is not ready"
+  pass "fm-pack: the tree walk refuses newline and non-UTF-8 names and an unreadable directory instead of skipping it"
+}
+
 test_resolve_unbound() {
   local out
   out=$(run_pack "$HOME_A" resolve lumen --json) || fail "resolve of an unbound project failed"
@@ -488,6 +532,7 @@ fm_test_run \
   test_version_and_usage \
   test_install_digest_and_modes \
   test_install_refusals \
+  test_tree_walk_refusals \
   test_resolve_unbound \
   test_resolve_kinds_and_phases \
   test_resolve_conditions_and_narrowing \
