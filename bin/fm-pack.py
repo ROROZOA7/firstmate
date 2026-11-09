@@ -159,8 +159,11 @@ def tree_digest(root, installed=False):
             total += st.st_size
             if total > MAX_TREE_BYTES:
                 raise Refusal("pack-oversized", f"more than {MAX_TREE_BYTES} bytes")
+            h = hashlib.sha256()
             with open(full, "rb") as fh:
-                sha = hashlib.sha256(fh.read()).hexdigest()
+                for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                    h.update(chunk)
+            sha = h.hexdigest()
             lines.append(f"{mode} {sha} {rel}\n")
             files.append(rel)
         if entries > MAX_TREE_ENTRIES:
