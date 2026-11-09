@@ -163,8 +163,9 @@
 # `--intent`. Only after the brief is written is the same resolve frozen to
 # data/<task-id>/pack.json with `fm-pack.sh record --replace`, so a failed
 # scaffold leaves no record and a re-scaffold (for example to add --herdr-lab)
-# replaces a stale one; if that record cannot be written, the brief just
-# written is removed again. --pack-kind names the task kind that picks the
+# replaces a stale one; a brief scaffolded with no Playbook (no --pack, or no
+# pack bound) removes any earlier record for that task id; if the record cannot
+# be written, the brief just written is removed again. --pack-kind names the task kind that picks the
 # pack's task skills (default `default`); --pack-labels passes the ticket's
 # labels (a `qa` label skips the build phase) and --pack-ticket the ticket body
 # whose `Skills:` line replaces the task skills. A project with no pack bound
@@ -539,7 +540,12 @@ mkdir -p "$DATA/$ID"
 # cannot be written removes the brief this run just wrote, so the two never
 # disagree.
 append_pack_section() {
-  [ -n "$PACK_SECTION" ] || return 0
+  if [ -z "$PACK_SECTION" ]; then
+    # A brief with no Playbook must not sit beside a record from an earlier
+    # scaffold of the same task id.
+    rm -f "$DATA/$ID/pack.json"
+    return 0
+  fi
   printf '\n%s\n' "$PACK_SECTION" >> "$BRIEF"
   local pack_out
   pack_out=$(FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" FM_CONFIG_OVERRIDE="$CONFIG" \

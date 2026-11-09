@@ -233,6 +233,54 @@ def _tree_digest(root, installed):
 
 # --- YAML and manifest validation ---------------------------------------------
 
+MAX_YAML_NODES = 20000
+
+
+class _NoAliasLoader(yaml.SafeLoader):
+    """SafeLoader that refuses anchors and aliases, so a small file cannot
+    expand into a huge structure (the billion-laughs pattern)."""
+
+    def compose_node(self, parent, index):
+        if self.check_event(yaml.AliasEvent):
+            raise yaml.YAMLError("YAML aliases are not allowed")
+        event = self.peek_event()
+        if getattr(event, "anchor", None):
+            raise yaml.YAMLError("YAML anchors are not allowed")
+        return super().compose_node(parent, index)
+
+
+def _count_nodes(value, limit):
+    stack, seen = [value], 0
+    while stack:
+        item = stack.pop()
+        seen += 1
+        if seen > limit:
+            return seen
+        if isinstance(item, dict):
+            stack.extend(item.keys())
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+    return seen
+
+
+def safe_yaml(text):
+    """Parse YAML with no anchors or aliases and at most MAX_YAML_NODES nodes."""
+    value = yaml.load(text, Loader=_NoAliasLoader)  # noqa: S506 - SafeLoader subclass
+    if _count_nodes(value, MAX_YAML_NODES) > MAX_YAML_NODES:
+        raise yaml.YAMLError(f"more than {MAX_YAML_NODES} YAML nodes")
+    return value
+
+
+def summary(value):
+    """A bounded description of a repo-supplied value: never a full repr."""
+    if isinstance(value, str):
+        return f"string({len(value)}) {value[:60]!r}" if len(value) <= 60 else f"string({len(value)})"
+    if isinstance(value, (list, dict)):
+        return f"{type(value).__name__}({len(value)})"
+    return type(value).__name__
+
+
 def read_yaml(path, code):
     try:
         st = os.lstat(path)
@@ -245,9 +293,9 @@ def read_yaml(path, code):
     with open(path, "rb") as fh:
         raw = fh.read()
     try:
-        value = yaml.safe_load(raw.decode("utf-8"))
-    except (yaml.YAMLError, UnicodeDecodeError) as exc:
-        raise Refusal(code, f"cannot parse {path}: {exc}") from None
+        value = safe_yaml(raw.decode("utf-8"))
+    except (yaml.YAMLError, UnicodeDecodeError, RecursionError) as exc:
+        raise Refusal(code, f"cannot parse {path}: {str(exc)[:300]}") from None
     return value, raw
 
 
@@ -356,7 +404,8 @@ def load_manifest(root):
     verify = []
     for vc in _list(m.get("verify_commands"), "verify_commands", "manifest-invalid"):
         vc = _dict(vc, "verify_commands[]", "manifest-invalid")
-        verify.append({"id": _str(vc.get("id"), "verify id", "manifest-invalid"), "cmd": _str(vc.get("cmd"), "verify cmd", "manifest-invalid")})
+        verify.append({"id": _one_line(_str(vc.get("id"), "verify id", "manifest-invalid"), "verify id", "manifest-invalid"),
+                       "cmd": _one_line(_str(vc.get("cmd"), "verify cmd", "manifest-invalid"), "verify cmd", "manifest-invalid")})
     harnesses = [_str(h, "harnesses", "manifest-invalid") for h in _list(m.get("harnesses"), "harnesses", "manifest-invalid")] or list(DEFAULT_HARNESSES)
     preamble = _inside(root, m.get("preamble"), "preamble") if m.get("preamble") is not None else None
     allow_global = set(_skill_list(skills.get("allow_global"), "allow_global"))
@@ -445,12 +494,31 @@ def find_pack(home, name, version, digest):
         return _VERIFIED[key]
     hexd = digest.split(":", 1)[1]
     ndir = os.path.join(home.packs, name)
+
+    def fault(reason, detail):
+        return Refusal("digest-mismatch", f"installed tree {name}#{digest}: {detail}", reason=reason)
+
     candidates = []
-    if os.path.isdir(ndir) and not os.path.islink(ndir):
-        for ver in sorted(os.listdir(ndir)):
-            path = os.path.join(ndir, ver, hexd)
-            if VERSION_RE.match(ver) and os.path.lexists(path):
-                candidates.append(path)
+    try:
+        for parent in (home.packs, ndir):
+            if os.path.islink(parent):
+                raise fault("link-unsafe", f"{os.path.relpath(parent, home.data)} is a symbolic link")
+        if os.path.lexists(ndir):
+            if not os.path.isdir(ndir):
+                raise fault("link-unsafe", f"{os.path.relpath(ndir, home.data)} is not a directory")
+            for ver in sorted(os.listdir(ndir)):
+                vdir = os.path.join(ndir, ver)
+                path = os.path.join(vdir, hexd)
+                if not VERSION_RE.match(ver):
+                    continue
+                if os.path.islink(vdir):
+                    if os.path.lexists(path):
+                        raise fault("link-unsafe", f"version directory {name}/{ver} is a symbolic link")
+                    continue
+                if os.path.lexists(path):
+                    candidates.append(path)
+    except OSError as exc:
+        raise fault("tree-unreadable", f"{exc.filename}: {exc.strerror}") from None
     if not candidates:
         raise Refusal("pack-not-installed", f"{name}#{digest} is not installed under data/.packs")
     if len(candidates) > 1:
@@ -535,11 +603,18 @@ def load_binding(home, project):
     return out
 
 
+def _one_line(value, label, code):
+    if "\n" in value or "\r" in value:
+        raise Refusal(code, f"{label} must be a single line")
+    return value
+
+
 def _verify_list(value, label, code):
     out = []
     for vc in _list(value, label, code):
         vc = _dict(vc, f"{label}[]", code)
-        out.append({"id": _str(vc.get("id"), f"{label} id", code), "cmd": _str(vc.get("cmd"), f"{label} cmd", code)})
+        out.append({"id": _one_line(_str(vc.get("id"), f"{label} id", code), f"{label} id", code),
+                    "cmd": _one_line(_str(vc.get("cmd"), f"{label} cmd", code), f"{label} cmd", code)})
     ids = [v["id"] for v in out]
     if len(set(ids)) != len(ids):
         raise Refusal(code, f"duplicate id in {label}")
@@ -568,22 +643,22 @@ def all_bindings(home):
 class Repo:
     """Read-only view of a project's origin/<default> tree."""
 
-    def __init__(self, path, bin_dir):
+    def __init__(self, path):
         self.path = path
         self.ref = None
         self.files = None
         if not os.path.isdir(os.path.join(path, ".git")) and not os.path.isfile(os.path.join(path, ".git")):
             return
-        # The default branch name comes from the shared helper
-        # (bin/fm-tangle-lib.sh fm_default_branch); only origin's copy is read.
-        try:
-            res = subprocess.run(["bash", "-c", '. "$1/fm-tangle-lib.sh" && fm_default_branch "$2"', "fm-pack",
-                                  bin_dir, path], capture_output=True, timeout=30, check=False)
-            branch = res.stdout.decode("utf-8", "replace").strip() if res.returncode == 0 else ""
-        except (OSError, subprocess.TimeoutExpired):
-            branch = ""
-        if branch and self._git("rev-parse", "--verify", "--quiet", f"origin/{branch}^{{commit}}"):
-            self.ref = f"origin/{branch}"
+        # origin/HEAD names the default branch; without it, origin/main then
+        # origin/master. Only origin's copy is ever read, never a local branch
+        # or a worker's checkout.
+        head = self._git("symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
+        candidates = [head] if head and head.startswith("origin/") else []
+        candidates += ["origin/main", "origin/master"]
+        for ref in candidates:
+            if self._git("rev-parse", "--verify", "--quiet", ref + "^{commit}"):
+                self.ref = ref
+                break
         if self.ref:
             listing = self._git("ls-tree", "-r", "-z", "--name-only", self.ref, raw=True)
             self.files = [f for f in (listing or "").split("\0") if f]
@@ -654,14 +729,14 @@ def parse_repo_narrowing(repo):
     try:
         if len(text) > MAX_YAML_BYTES:
             return [], [], [{"item": ".firstmate/pack.yaml", "reason": f"larger than {MAX_YAML_BYTES} bytes"}]
-        value = yaml.safe_load(text)
+        value = safe_yaml(text)
     except (yaml.YAMLError, ValueError, TypeError, RecursionError) as exc:
-        return [], [], [{"item": ".firstmate/pack.yaml", "reason": f"unparseable: {exc}"}]
+        return [], [], [{"item": ".firstmate/pack.yaml", "reason": f"unparseable: {str(exc)[:300]}"}]
     if value is None:
         return [], [], ignored
     if not isinstance(value, dict):
         return [], [], [{"item": ".firstmate/pack.yaml", "reason": "not a mapping"}]
-    for key in sorted((str(k) for k in value if k != "narrow"), key=str):
+    for key in sorted(summary(k) if not isinstance(k, str) else k[:100] for k in value if k != "narrow"):
         ignored.append({"item": key, "reason": "repo files may only narrow"})
     narrow = value.get("narrow")
     if narrow is None:
@@ -669,7 +744,7 @@ def parse_repo_narrowing(repo):
     if not isinstance(narrow, dict):
         ignored.append({"item": "narrow", "reason": "must be a mapping"})
         narrow = {}
-    for key in sorted(str(k) for k in narrow if k not in ("skills_disable", "verify_add")):
+    for key in sorted(summary(k) if not isinstance(k, str) else k[:100] for k in narrow if k not in ("skills_disable", "verify_add")):
         ignored.append({"item": f"narrow.{key}", "reason": "repo files may only narrow"})
     disable = []
     raw_disable = narrow.get("skills_disable")
@@ -680,7 +755,7 @@ def parse_repo_narrowing(repo):
         if isinstance(item, str) and SKILL_RE.match(item):
             disable.append(item)
         else:
-            ignored.append({"item": f"narrow.skills_disable {item!r}"[:200], "reason": "not a skill name"})
+            ignored.append({"item": f"narrow.skills_disable {summary(item)}", "reason": "not a skill name"})
     verify = []
     raw_verify = narrow.get("verify_add")
     if raw_verify is not None and not isinstance(raw_verify, list):
@@ -688,9 +763,12 @@ def parse_repo_narrowing(repo):
         raw_verify = []
     for vc in raw_verify or []:
         if isinstance(vc, dict) and isinstance(vc.get("id"), str) and isinstance(vc.get("cmd"), str) and vc["id"] and vc["cmd"]:
+            if any(c in vc["id"] + vc["cmd"] for c in "\n\r"):
+                ignored.append({"item": f"narrow.verify_add {summary(vc.get('id'))}", "reason": "id and cmd must be single lines"})
+                continue
             verify.append({"id": vc["id"], "cmd": vc["cmd"]})
         else:
-            ignored.append({"item": f"narrow.verify_add {vc!r}"[:200], "reason": "needs {id, cmd}"})
+            ignored.append({"item": f"narrow.verify_add {summary(vc)}", "reason": "needs {id, cmd}"})
     return disable, verify, ignored
 
 
@@ -808,8 +886,10 @@ def resolve(home, project, kind=None, harness=None, task=None, labels=None, star
     try:
         binding = binding_override if binding_override is not None else load_binding(home, project)
     except Refusal as exc:
+        # A binding file exists but is unusable: not "unbound", and not ready.
         refuse(exc.code, exc.detail)
         readiness["ok"] = False
+        out["binding_file"] = f"data/.pack-bindings/{project}.yaml"
         return out
     if binding is None:
         readiness["note"] = "no pack bound"
@@ -842,9 +922,11 @@ def resolve(home, project, kind=None, harness=None, task=None, labels=None, star
             return value
         return {h: value for h in harnesses}
 
-    repo = Repo(os.path.join(home.projects, project), home.bin)
+    repo = Repo(os.path.join(home.projects, project))
     if not repo.available:
-        warn("project-clone-missing", "conditions, repo narrowing and .worktreeinclude were not read")
+        # The .worktreeinclude secret gate must never be skipped silently.
+        refuse("project-ref-unknown", f"projects/{project} has no readable origin/<default> (origin/HEAD, origin/main or "
+               "origin/master); conditions, repo narrowing and the .worktreeinclude check cannot run")
     repo_disable, repo_verify, repo_ignored = parse_repo_narrowing(repo)
     out["ignored"].extend(repo_ignored)
 
@@ -1078,8 +1160,6 @@ def render_brief(r, heading_level=2, task_dir=None):
     if pre.get("path"):
         with open(pre["path"], "r", encoding="utf-8") as fh:
             text = fh.read()
-        if re.search(r"^\s*Delivery contract:", text, re.M):
-            raise Refusal("preamble-unsafe", "the pack preamble carries a 'Delivery contract:' line; the delivery mode is a per-task decision")
         lines += [shift_headings(text.rstrip("\n"), heading_level), ""]
     lines.append("Skills - read and follow before the matching step (absolute paths):")
     kind = r.get("kind") or "default"
@@ -1112,7 +1192,16 @@ def render_brief(r, heading_level=2, task_dir=None):
     lines.append(f"Definition of done adds: run every verify command at your final head and record it in `{evidence}` (schema fm-evidence.v1).")
     lines += [f"- {v['cmd']}" for v in r.get("verify_commands", [])]
     lines.append("If your sandbox cannot write that file, put the same JSON in your final report and say the file could not be written; never record a command as passing that did not run.")
-    return "\n".join(lines) + "\n"
+    text = "\n".join(lines) + "\n"
+    # Every rendered line is checked, whatever its source (preamble, skill
+    # path, verify command): the section must never carry a line the spawn
+    # gate could read as the brief's delivery contract.
+    for line in text.splitlines():
+        if re.match(r"^\s*(?:[-*]\s+)?Delivery contract:", line):
+            raise Refusal("playbook-unsafe", f"a rendered Playbook line looks like a delivery contract: {line[:120]!r}")
+    if any(c in v.get("cmd", "") + v.get("id", "") for v in r.get("verify_commands", []) for c in "\n\r"):
+        raise Refusal("playbook-unsafe", "a verify command spans more than one line")
+    return text
 
 
 # --- diff ------------------------------------------------------------------------
@@ -1132,9 +1221,25 @@ def _read_text(path):
         return None
 
 
+MAX_DIFF_LINE = 4096
+
+
 def _text_diff(a_path, b_path, label):
+    """A unified diff, or the marker "binary-or-large" for a file that is over
+    the 64 KB cap, not UTF-8, or has a line longer than 4 KB."""
+    for path in (a_path, b_path):
+        if path:
+            try:
+                if os.lstat(path).st_size > TEXT_DIFF_LIMIT:
+                    return "binary-or-large"
+            except OSError:
+                return "binary-or-large"
     a = _read_text(a_path) if a_path else ""
     b = _read_text(b_path) if b_path else ""
+    if a is None or b is None or "\0" in (a + b):
+        return "binary-or-large"
+    if any(len(line) > MAX_DIFF_LINE for line in (a + "\n" + b).splitlines()):
+        return "binary-or-large"
     if a == b:
         return None
     diff = "".join(difflib.unified_diff((a or "").splitlines(True), (b or "").splitlines(True), f"a/{label}", f"b/{label}"))
@@ -1217,7 +1322,10 @@ def diff(home, project, to_ref):
                   "after": {"mode": b[0], "sha256": b[1]} if b else None}
         td = _text_diff(os.path.join(from_root, *rel.split("/")) if a else None,
                         os.path.join(to_root, *rel.split("/")) if b else None, rel)
-        if td:
+        if td == "binary-or-large":
+            change["text_diff"] = None
+            change["content"] = "binary-or-large"
+        elif td:
             change["text_diff"] = td
         if (a and a[0] == "755") or (b and b[0] == "755"):
             change["executable"] = True
@@ -1226,23 +1334,34 @@ def diff(home, project, to_ref):
     out["risk_changes"] = ([{"op": "add", "risk": r} for r in sorted(after_risk - before_risk)]
                            + [{"op": "remove", "risk": r} for r in sorted(before_risk - after_risk)])
     out["requires_captain"] = any(
-        c["kind"] in ("hook", "mcp", "setting", "banned", "policy", "preamble") or c.get("executable")
+        c["kind"] in ("hook", "mcp", "setting", "banned", "policy", "preamble", "plugin") or c.get("executable")
         for c in changes) or bool(out["risk_changes"])
     return out
 
 
 def _file_kind(rel):
-    """The change kind for one pack file."""
+    """The change kind for one pack file.
+
+    Anything a harness could load as a hook or an MCP server - plugin.json,
+    any hooks.json or .mcp.json at any depth, and anything under a hooks/
+    directory - is classified so that a change to it requires the captain.
+    """
+    base = rel.rsplit("/", 1)[-1]
+    parts = rel.split("/")
     if rel == "policy/preamble.md":
         return "preamble"
     if rel.startswith("policy/"):
         return "policy"
+    if rel == ".claude-plugin/plugin.json" or rel.startswith(".claude-plugin/"):
+        return "plugin"
+    if base == ".mcp.json" or base.endswith(".mcp.json"):
+        return "mcp"
+    if base == "hooks.json" or "hooks" in parts[:-1]:
+        return "hook"
     if rel.startswith("skills/"):
         return "skill-file"
-    if rel in ("pack.yaml", ".claude-plugin/plugin.json"):
+    if rel == "pack.yaml":
         return "manifest"
-    if rel.startswith("hooks/"):
-        return "hook"
     return "file"
 
 
@@ -1392,31 +1511,62 @@ def install(home, repo_url, commit, subpath, expect_digest=None):
         shutil.rmtree(work, ignore_errors=True)
 
 
+def _fresh_readiness(home, project, frozen):
+    """Cheap re-check of a saved resolve: the binding is unchanged, the pack
+    still verifies at its digest, and origin/<default> is readable with no
+    secret .worktreeinclude. Returns refusals (empty when ready)."""
+    refusals = []
+    try:
+        binding = load_binding(home, project)
+    except Refusal as exc:
+        return [exc.as_dict()]
+    fb = frozen.get("binding")
+    if binding is None:
+        return [{"code": "binding-changed", "detail": "the project is no longer bound"}] if fb else []
+    if not isinstance(fb, dict) or fb.get("digest") != binding["digest"] or fb.get("binding_digest") != binding["binding_digest"]:
+        return [{"code": "binding-changed", "detail": "the binding changed between render and record"}]
+    try:
+        find_pack(home, binding["pack"], binding["version"], binding["digest"])
+    except Refusal as exc:
+        refusals.append(exc.as_dict())
+    repo = Repo(os.path.join(home.projects, project))
+    if not repo.available:
+        refusals.append({"code": "project-ref-unknown", "detail": f"projects/{project} has no readable origin/<default>"})
+    else:
+        secret = worktreeinclude_secret(repo)
+        if secret is not None:
+            refusals.append({"code": "secret-worktreeinclude", "detail": f".worktreeinclude line {secret!r} matches a secret pattern"})
+    return refusals
+
+
 def record(home, project, task, replace=False, from_file=None, **kwargs):
     """Freeze a resolve to data/<task>/pack.json.
 
     from_file records an already-rendered resolve (fm-brief.sh renders first,
-    then records last) after checking it is the same binding and readiness
-    still holds; otherwise resolve runs here.
+    then records last): the saved resolve must itself be ready, and a fresh
+    readiness re-check (binding, pack digest, origin ref, .worktreeinclude) must
+    pass. Otherwise resolve runs here.
     """
     if not TASK_RE.match(task or ""):
         raise UsageError(f"invalid task id {task!r}")
-    r = resolve(home, project, **kwargs)
     if from_file is not None:
         try:
             with open(from_file, "rb") as fh:
-                frozen = json.loads(fh.read().decode("utf-8"))
+                r = json.loads(fh.read().decode("utf-8"))
         except (OSError, ValueError) as exc:
             raise UsageError(f"--from-file: {exc}") from None
-        if not isinstance(frozen, dict) or frozen.get("schema") != SCHEMA or frozen.get("project") != project:
+        if not isinstance(r, dict) or r.get("schema") != SCHEMA or r.get("project") != project \
+                or not isinstance(r.get("readiness"), dict):
             raise UsageError("--from-file is not a resolve of this project")
-        if frozen.get("binding") != r.get("binding"):
-            raise Refusal("binding-changed", "the binding changed between render and record")
-        r = frozen
-    if r["binding"] is None:
+        fresh = _fresh_readiness(home, project, r)
+        if fresh:
+            raise Refusal("not-ready", "; ".join(f"{x['code']}: {x.get('detail', '')}" for x in fresh))
+    else:
+        r = resolve(home, project, **kwargs)
+    if not r["readiness"].get("ok"):
+        raise Refusal("not-ready", "; ".join(f"{x['code']}: {x.get('detail', '')}" for x in r["readiness"].get("refusals", [])))
+    if r.get("binding") is None:
         return {"recorded": False, "note": "no pack bound", "path": None}, r
-    if not r["readiness"]["ok"]:
-        raise Refusal("not-ready", "; ".join(f"{x['code']}: {x['detail']}" for x in r["readiness"]["refusals"]))
     render_brief(r)  # refuses an unsafe preamble before anything is written
     tdir = os.path.join(home.data, task)
     os.makedirs(tdir, exist_ok=True)
@@ -1552,7 +1702,7 @@ def main(argv):
                 raise UsageError("render-brief needs --kind <k>")
             r = resolve(home, pos[0], **resolve_kwargs(opts))
         task_dir = os.path.join(home.data, task) if task else None
-        if opts.get("--require-ready") and r.get("binding") and not (r.get("readiness") or {}).get("ok"):
+        if opts.get("--require-ready") and not (r.get("readiness") or {}).get("ok"):
             sys.stderr.write("fm-pack: render-brief refused: the pack is not ready: "
                              + "; ".join(f"{x.get('code')}: {x.get('detail')}" for x in r["readiness"].get("refusals", [])) + "\n")
             return 3

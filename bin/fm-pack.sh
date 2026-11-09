@@ -62,10 +62,12 @@
 #                 binding:null and readiness ok with a note.
 #   diff          what changes for <project> if it were bound to the target
 #                 digest: resolved skills, verify commands and banned items,
-#                 plus every file in either tree by per-file sha (with a text
-#                 diff, cut at 64 KB). requires_captain is true when hooks, mcp,
-#                 settings, banned items, policy/ files or any executable
-#                 change, or the risk flags change.
+#                 plus every file in either tree by per-file sha, with a text
+#                 diff (content "binary-or-large" instead for a file over 64 KB,
+#                 not UTF-8, or with a line over 4 KB). requires_captain is true
+#                 when hooks, mcp, settings, banned items, policy/ files,
+#                 .claude-plugin/, any hooks.json, *.mcp.json or hooks/ file, or
+#                 any executable change, or the risk flags change.
 #   render-brief  the brief's Playbook section as text: preamble, absolute
 #                 installed skill paths per phase, banned items, and the verify
 #                 commands the definition of done adds. --from-record renders
@@ -82,8 +84,16 @@
 #                 data/<task>/pack.json, refusing when readiness is not ok, the
 #                 preamble is unsafe, or a record already exists (--replace
 #                 overwrites it on purpose). --from-file records a saved resolve
-#                 instead, after checking the binding has not changed since.
+#                 instead; it must itself be ready, and a fresh check of the
+#                 binding, the pack digest, origin/<default> and
+#                 .worktreeinclude must still pass.
 #
+# A binding file that exists but cannot be used is not "unbound": readiness
+# fails. A project clone with no readable origin/<default> (origin/HEAD, else
+# origin/main, else origin/master) refuses project-ref-unknown, so the
+# .worktreeinclude check is never skipped. YAML anchors and aliases are refused
+# in every file read. Verify commands must be single lines, and no rendered
+# Playbook line may read as a "Delivery contract:" line.
 # Installed packs are found by name and digest; the version is display only.
 # Any fault in an installed tree (changed bytes, a link, a mode, an unreadable
 # entry) is reported as digest-mismatch with the specific cause in `reason`.
