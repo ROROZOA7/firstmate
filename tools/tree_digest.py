@@ -5,9 +5,9 @@
 - Only real directories and regular files with nlink == 1 are allowed; any symlink (file or
   directory), device, FIFO, socket or hard link is refused. An unreadable directory is refused,
   not skipped.
-- Each file is opened with O_NOFOLLOW and re-checked on the fd (regular, nlink == 1, size);
+- Each file is opened with O_NOFOLLOW and re-checked on the fd (regular, nlink == 1, same dev/inode/size as lstat);
   exactly the fstat size is hashed, and a file that is shorter or longer than that is refused.
-- Names containing \\n or \\r, or that don't encode as UTF-8, are refused.
+- Names containing \\n, \\r or a backslash, or that don't encode as UTF-8, are refused.
 - Limits: at most 4096 entries (files + directories) and 64 MiB of file content in total.
 - Files are stream-hashed in 1 MiB chunks.
 
@@ -25,8 +25,8 @@ class Refuse(Exception):
 
 
 def check_name(path, name):
-    if "\n" in name or "\r" in name:
-        raise Refuse(f"name contains a newline: {path!r}")
+    if "\n" in name or "\r" in name or "\\" in name:
+        raise Refuse(f"name contains a newline or backslash: {path!r}")
     try:
         name.encode("utf-8")
     except UnicodeEncodeError:
@@ -36,7 +36,8 @@ def check_name(path, name):
 def file_sha256(path, budget):
     """Hash exactly the bytes fstat reports; return (hexdigest, mode, size).
     Refuses before reading if the file is larger than the remaining byte budget."""
-    if not stat.S_ISREG(os.lstat(path).st_mode):   # don't open a FIFO/device at all
+    lst = os.lstat(path)
+    if not stat.S_ISREG(lst.st_mode):   # don't open a FIFO/device at all
         raise Refuse(f"not a plain regular file: {path!r}")
     flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
@@ -45,7 +46,8 @@ def file_sha256(path, budget):
         raise Refuse(f"cannot open without following links: {path!r} ({e.strerror})")
     try:
         st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+        if (not stat.S_ISREG(st.st_mode) or st.st_nlink != 1
+                or (st.st_dev, st.st_ino, st.st_size) != (lst.st_dev, lst.st_ino, lst.st_size)):
             raise Refuse(f"not a plain regular file: {path!r}")
         if st.st_size > budget:
             raise Refuse(f"more than {MAX_BYTES} bytes of content")
