@@ -1,0 +1,82 @@
+schema: fm-pack-manifest.v1
+requires: {fm_pack: 1}
+name: core
+version: 0.1.0
+description: Default worker playbook ported from super-board
+harnesses: [claude, codex, opencode, pi]
+skills:
+  vendored:
+    - id: build-method
+      provenance: {repo: github.com/ROROZOA7/super-board, commit: d0b7d5a6850614ca809477c1af43d5d7da408726, license: MIT, path: skills/super-build}
+      note: method ported from super-build SKILL.md + references/worker-preamble.md + references/decision-policy.md; board glue stripped
+    - id: review-method
+      provenance: {repo: github.com/ROROZOA7/super-board, commit: d0b7d5a6850614ca809477c1af43d5d7da408726, license: MIT, path: skills/super-review}
+      note: method ported from super-review SKILL.md; board glue stripped
+    - id: pr-security-review
+      provenance: {repo: github.com/ROROZOA7/super-board, commit: d0b7d5a6850614ca809477c1af43d5d7da408726, license: MIT, path: skills/pr-security-review}
+      upstream: {repo: github.com/anthropics/claude-code-security-review, commit: 0c6a49f, license: MIT, path: .claude/commands/security-review.md}
+    - id: tdd
+      provenance: {repo: github.com/mattpocock/skills, commit: 4ae2317ddb22b046e26455e4f9c9b3aaaf62212d, license: MIT, path: skills/engineering/tdd}
+    - id: diagnosing-bugs
+      provenance: {repo: github.com/mattpocock/skills, commit: 4ae2317ddb22b046e26455e4f9c9b3aaaf62212d, license: MIT, path: skills/engineering/diagnosing-bugs}
+    - id: implement
+      provenance: {repo: github.com/mattpocock/skills, commit: 4ae2317ddb22b046e26455e4f9c9b3aaaf62212d, license: MIT, path: skills/engineering/implement}
+    - id: codebase-design
+      provenance: {repo: github.com/mattpocock/skills, commit: 4ae2317ddb22b046e26455e4f9c9b3aaaf62212d, license: MIT, path: skills/engineering/codebase-design}
+    - id: code-review
+      provenance: {repo: github.com/mattpocock/skills, commit: 4ae2317ddb22b046e26455e4f9c9b3aaaf62212d, license: MIT, path: skills/engineering/code-review}
+    - id: domain-modeling
+      provenance: {repo: github.com/mattpocock/skills, commit: 4ae2317ddb22b046e26455e4f9c9b3aaaf62212d, license: MIT, path: skills/engineering/domain-modeling}
+    - id: verification-before-completion
+      provenance: {repo: github.com/obra/superpowers, commit: 22f0b463e7a5e579904dd6211a520321035526f7, license: MIT, path: skills/verification-before-completion}
+    - id: testing-strategy
+      provenance: {repo: github.com/anthropics/knowledge-work-plugins, commit: e050c2ec856373787143d7057663a6ebd1277df3, license: Apache-2.0, path: engineering/skills/testing-strategy}
+    - id: vitest
+      provenance: {repo: github.com/antfu/skills, commit: f63e9ec7bc85f67364b6596c2d29da87e83ce445, license: MIT, path: skills/vitest}
+    - id: playwright-best-practices
+      provenance: {repo: github.com/currents-dev/playwright-best-practices-skill, commit: 0b75b5835a87de1fdd202ba965f3bc5a27738fdf, license: MIT, path: playwright-best-practices}
+  allow_global: [ponytail, ponytail-review]   # only fallback-backed names
+  aliases:
+    "mattpocock-skills:tdd": tdd
+    "mattpocock-skills:diagnosing-bugs": diagnosing-bugs
+    "mattpocock-skills:implement": implement
+    "mattpocock-skills:codebase-design": codebase-design
+    "mattpocock-skills:code-review": code-review
+    "mattpocock-skills:domain-modeling": domain-modeling
+    "ponytail:ponytail": ponytail
+    "ponytail:ponytail-review": ponytail-review
+    "superpowers:verification-before-completion": verification-before-completion
+  by_kind:                       # ordered list; FIRST matching row wins (lowercased labels)
+    - {labels: [bug],                 required: [diagnosing-bugs, tdd]}
+    - {labels: [feature],             required: [implement, tdd, codebase-design]}
+    - {labels: [ux],                  required: [implement, tdd]}
+    - {labels: [refactor, tech-debt], required: [codebase-design, tdd]}
+    - {labels: [tests],               required: [tdd]}
+    - {labels: [docs],                required: []}
+  default: {required: [diagnosing-bugs, tdd, implement, codebase-design]}   # unclassified at intake
+  by_phase:
+    build:
+      required: [build-method, ponytail, verification-before-completion, code-review]
+      optional: [testing-strategy, domain-modeling]
+      conditional:
+        - {id: vitest, when: "file:vitest.config.*"}
+        - {id: playwright-best-practices, when: "file:playwright.config.*"}
+    verify:
+      required: [tdd, diagnosing-bugs, verification-before-completion, testing-strategy, code-review, pr-security-review]
+      conditional:
+        - {id: vitest, when: "file:vitest.config.*"}
+        - {id: playwright-best-practices, when: "file:playwright.config.*"}
+    review:
+      required: [review-method, code-review, codebase-design]
+      optional: [ponytail-review]
+  fallbacks:
+    - {for: ponytail,        path: policy/fallbacks/simplest-solution-first.md}
+    - {for: ponytail-review, path: policy/fallbacks/over-engineering-ladder.md}
+banned_tools: [AskUserQuestion]
+banned_skills: [grilling, shape, clarify, improve-codebase-architecture]   # advisory; matches <ns>:<name> too
+preamble: policy/preamble.md
+verify_commands: []                       # the gate invents none; bindings supply them
+evidence:
+  required: [verify_commands, decisions]
+model_hint: null
+settings: {}

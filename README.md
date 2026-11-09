@@ -8,4 +8,10 @@ Packs are pinned by `{repo, commit, path, tree_digest}` and installed by `bin/fm
 - Each pack lives in `<name>/` with `pack.yaml`, `.claude-plugin/plugin.json`, `skills/`, `policy/` and `NOTICES.md`.
 - Vendored third-party skills must carry `provenance: {repo, commit, license, path}` and attribution in `NOTICES.md`.
 
-Packs: `core/` (pilot, work in progress on branch `feat/pack-core`, off this branch).
+Packs: `core/` (pilot, PR #1).
+
+Compute a pack's tree digest (contracts §1): `python3 -I tools/tree_digest.py core`
+
+Known limitation: `tools/tree_digest.py` is a reference implementation. It doesn't walk with
+`openat`/`dir_fd`, so it doesn't catch a parent directory being swapped for a symlink mid-walk.
+`bin/fm-pack.sh`'s install copy is the security boundary.
