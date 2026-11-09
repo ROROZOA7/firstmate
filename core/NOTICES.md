@@ -36,7 +36,10 @@ pack's own text fallbacks apply (`policy/fallbacks/`), and those are derived fro
   stay clean. `policy/preamble.md` → "Vendored skills run unattended" overrides those steps.
 - `implement` sets `disable-model-invocation: true` and invokes `tdd` and `code-review` by bare
   name, which could load an unpinned global copy. The preamble requires loading pack skills by
-  the absolute paths in the brief. Until Phase B enforcement exists this is advisory only.
+  `<pack>/skills/<name>/SKILL.md` for every vendored skill (the `allow_global` ponytail names
+  are the exception). Sub-agent briefs must carry the spec and the unattended rules, because
+  `code-review` spawns sub-agents with a fresh context. Until Phase B enforcement exists, all of
+  this is advisory only.
 
 ## File modes
 

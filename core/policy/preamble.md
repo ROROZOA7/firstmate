@@ -57,6 +57,16 @@ Record **every** decision the ladder settles, at whatever rung, in `evidence.jso
 {"rung": "repo-precedent", "choice": "…", "why": "…"}
 ```
 
+A `human-gate` entry records a decision that is **still open**: `choice` is the gate key
+(`human-gate-<topic>`), and `why` is the open question, starting with `UNRESOLVED:`.
+
+```json
+{"rung": "human-gate", "choice": "human-gate-auth-scope", "why": "UNRESOLVED: may the export include emails?"}
+```
+
+An open gate is never a settled decision. A merge gate or squash body must not copy it as one;
+it lists open gates separately, or not at all.
+
 Optionally mirror it as a commit trailer `Decision: <rung>: <choice> — <why>`. Never as a
 co-author line.
 
@@ -77,10 +87,30 @@ written for an interactive session. This section overrides them:
 
 ## Loading pack skills
 
-Load each pack skill from the absolute path the brief gives (`<pack>/skills/<name>/SKILL.md`),
-**never by bare name** through the Skill tool. A bare name such as `tdd` or `code-review` can
-resolve to an unpinned global copy. This also applies when a vendored skill says to invoke
-another skill by name (`implement` does this for `tdd` and `code-review`).
+**Every** skill vendored in this pack lives at `<pack>/skills/<name>/SKILL.md`. `<pack>` is the
+pack directory the brief gives. This holds for skills the brief doesn't list too: when a vendored
+skill says to load another one (`tdd` loads `codebase-design`, `implement` invokes `tdd` and
+`code-review`), load it from that path.
+
+- **Never load a pack skill by bare name** through the Skill tool. A bare name such as `tdd` or
+  `code-review` can resolve to an unpinned global copy.
+- **Exception: the `allow_global` names, `ponytail` and `ponytail-review`.** These aren't vendored.
+  Load them by name when they're installed globally or as a plugin. When they aren't, use
+  their fallback: `policy/fallbacks/simplest-solution-first.md` for `ponytail`, and
+  `policy/fallbacks/over-engineering-ladder.md` for `ponytail-review`.
+
+## Sub-agents
+
+A sub-agent starts with a fresh context and never sees this preamble. Every sub-agent brief you
+write must carry, pasted in:
+
+1. the brief's Captain's intent and acceptance criteria (the spec);
+2. the unattended rules: never call `AskUserQuestion` or wait for a human; there is no issue
+   tracker or setup step; load skills only from `<pack>/skills/<name>/SKILL.md` (with the real
+   `<pack>` path), never by bare name; never merge.
+
+This covers `code-review`'s Standards and Spec sub-agents, `review-method`'s truth-check pair,
+and any other sub-agent a skill spawns.
 
 ## Method
 

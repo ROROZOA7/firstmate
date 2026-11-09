@@ -41,8 +41,10 @@ The brief lists the resolved skills. Load them in that order before writing code
 - **Vendored skills run unattended:** in vendored skills, every "ask/confirm with the user"
   step maps to the decision ladder, and anything still needing a human becomes
   `needs-decision: [key=human-gate-<topic>]`. The spec is the brief's Captain's intent and AC;
-  there is no issue-tracker setup. Load pack skills by the absolute paths in the brief, never
-  by bare name (preamble → "Vendored skills run unattended", "Loading pack skills").
+  there is no issue-tracker setup. Load every vendored skill from `<pack>/skills/<name>/SKILL.md`,
+  never by bare name; only `ponytail`/`ponytail-review` may load by name, else their fallback.
+  Every sub-agent brief carries the spec and the unattended rules (preamble → "Vendored skills
+  run unattended", "Loading pack skills", "Sub-agents").
 
 ## 2. Testing is three layers
 

@@ -73,7 +73,8 @@ file one for style, naming, anything an ADR already settled, or a shape the AC a
 ## 6. Adversarial truth-check
 
 Run it when the diff is ≥ 10 changed lines or touches security, migrations, payments or auth.
-Spawn two sub-agents in parallel with this brief, verbatim except for the slots:
+Spawn two sub-agents in parallel with this brief, verbatim except for the slots (the
+unattended line comes from preamble → "Sub-agents"):
 
 ```
 You are the <Code-grounder | Historian> in an adversarial truth-check of PR #<P>.
@@ -85,6 +86,8 @@ builder's summary below, as claims to check, not as the frame.
 ACs: <paste>
 Diff: <merge-base diff or path to it>
 Builder's summary (claims): <paste>
+Unattended: never call AskUserQuestion or wait for a human; no issue tracker or setup step;
+load skills only from <pack>/skills/<name>/SKILL.md, never by bare name; never merge.
 Budget: at most 50 gh calls; prefer local git. Over budget: confidence "insufficient_data".
 Class every finding: Gap / Bug / Verification miss / Scope drift / Over-engineering / No issue.
 Severity: Blocker / Should fix / Nit.
