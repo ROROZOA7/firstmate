@@ -130,7 +130,7 @@ def _hash_checked(full, rel, checked):
     and the size lstat reported; at most that many bytes are read, and a file
     that changed while it was read is refused rather than half-hashed.
     """
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
     try:
         fd = os.open(full, flags)
     except OSError as exc:

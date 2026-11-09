@@ -263,6 +263,13 @@ test_tree_walk_refusals() {
   run_pack "$h" install "$SRC" "$CORE_COMMIT" core --json >/dev/null
   bind "$h" web "$CORE_DIGEST"
   pack="$h/data/.packs/core/0.1.0/${CORE_DIGEST#sha256:}"
+  # A FIFO is refused from its lstat, before any open that could block on it.
+  if mkfifo "$pack/skills/tdd/pipe" 2>/dev/null; then
+    out=$(FM_HOME="$h" timeout 20 "$PACK" resolve web --json); local frc=$?
+    rm -f "$pack/skills/tdd/pipe"
+    [ "$frc" -ne 124 ] || fail "resolve hung on a FIFO in the pack tree"
+    assert_contains "$(json 'r["readiness"]["refusals"]' <<<"$out")" "not a regular file: skills/tdd/pipe" "a FIFO in the tree refuses"
+  fi
   chmod 000 "$pack/skills/vitest"
   if [ -r "$pack/skills/vitest" ]; then
     chmod 755 "$pack/skills/vitest"
@@ -280,7 +287,7 @@ test_tree_walk_refusals() {
   esac
   assert_equals 0 "$(json 'len([s for s in r["skills"] if s["id"]=="vitest" and s.get("path")])' <<<"$out")" "a refused tree lists no skill paths"
   assert_equals false "$(json 'r["readiness"]["ok"]' <<<"$out")" "an unreadable tree is not ready"
-  pass "fm-pack: the tree walk refuses newline and non-UTF-8 names and an unreadable directory instead of skipping it"
+  pass "fm-pack: the tree walk refuses newline and non-UTF-8 names, a FIFO without blocking, and an unreadable directory instead of skipping it"
 }
 
 test_resolve_unbound() {
