@@ -16,7 +16,6 @@
 # PR instead of shipping a new one).
 # Usage: fm-brief.sh <task-id> <repo-name> --mode <no-mistakes|direct-PR|local-only> [--branch-prefix <prefix>] [--base-branch <branch>] [--forge <none|gerrit|forgejo|external> [--shape squash]] [--pr <auto|manual>] [--herdr-lab]
 #        fm-brief.sh <task-id> <repo-name> --scout [--base-branch <branch>] [--herdr-lab]
-#        either crewmate form also takes [--pack <project> [--pack-kind <kind>] [--pack-labels <a,b>] [--pack-ticket <file>]]
 #        fm-brief.sh <task-id> --secondmate {<project>...|--no-projects}
 #   --scout writes the scout contract instead: the deliverable is a report at
 #   data/<task-id>/report.md (no branch, no push, no PR) and the worktree is scratch.
@@ -154,22 +153,6 @@
 # regular file, or text carrying its own "Delivery contract: mode=" line (which
 # a later scout promotion could not outrank), stops the scaffold before
 # anything is written. Secondmate charters never take it.
-# --pack <project> attaches the project's bound skill pack (bin/fm-pack.sh owns
-# the pack contract) to a ship or scout brief. Before anything is written, the
-# pack is resolved once and its `## Playbook` section rendered from that
-# resolve; a pack that is not ready, or an unsafe preamble, stops the scaffold
-# there. The section goes after the Definition of done and before any home
-# brief additions, never inside `# Task`, so it never reaches the no-mistakes
-# `--intent`. Only after the brief is written is the same resolve frozen to
-# data/<task-id>/pack.json with `fm-pack.sh record --replace`, so a failed
-# scaffold leaves no record and a re-scaffold (for example to add --herdr-lab)
-# replaces a stale one; a brief scaffolded with no Playbook (no --pack, or no
-# pack bound) removes any earlier record for that task id; if the record cannot
-# be written, the brief just written is removed again. --pack-kind names the task kind that picks the
-# pack's task skills (default `default`); --pack-labels passes the ticket's
-# labels (a `qa` label skips the build phase) and --pack-ticket the ticket body
-# whose `Skills:` line replaces the task skills. A project with no pack bound
-# changes nothing. Refused on --secondmate.
 # Refuses to overwrite an existing brief.
 set -eu
 
@@ -252,14 +235,6 @@ UPSTREAM_CONSENT=
 UPSTREAM_CONSENT_SET=0
 PROJECT_DIR=
 PROJECT_DIR_SET=0
-PACK_PROJECT=
-PACK_SET=0
-PACK_KIND=
-PACK_KIND_SET=0
-PACK_LABELS=
-PACK_LABELS_SET=0
-PACK_TICKET=
-PACK_TICKET_SET=0
 POS=()
 want_value=
 for a in "$@"; do
@@ -276,10 +251,6 @@ for a in "$@"; do
       pr) PR_TEXT=$a; PR_TEXT_SET=1 ;;
       upstream-consent) UPSTREAM_CONSENT=$a; UPSTREAM_CONSENT_SET=1 ;;
       project) PROJECT_DIR=$a; PROJECT_DIR_SET=1 ;;
-      pack) PACK_PROJECT=$a; PACK_SET=1 ;;
-      pack-kind) PACK_KIND=$a; PACK_KIND_SET=1 ;;
-      pack-labels) PACK_LABELS=$a; PACK_LABELS_SET=1 ;;
-      pack-ticket) PACK_TICKET=$a; PACK_TICKET_SET=1 ;;
       *) echo "error: internal parser state for --$want_value" >&2; exit 1 ;;
     esac
     want_value=
@@ -306,14 +277,6 @@ for a in "$@"; do
     --upstream-consent=*) UPSTREAM_CONSENT=${a#--upstream-consent=}; UPSTREAM_CONSENT_SET=1 ;;
     --project) want_value="project" ;;
     --project=*) PROJECT_DIR=${a#--project=}; PROJECT_DIR_SET=1 ;;
-    --pack) want_value="pack" ;;
-    --pack=*) PACK_PROJECT=${a#--pack=}; PACK_SET=1 ;;
-    --pack-kind) want_value="pack-kind" ;;
-    --pack-kind=*) PACK_KIND=${a#--pack-kind=}; PACK_KIND_SET=1 ;;
-    --pack-labels) want_value="pack-labels" ;;
-    --pack-labels=*) PACK_LABELS=${a#--pack-labels=}; PACK_LABELS_SET=1 ;;
-    --pack-ticket) want_value="pack-ticket" ;;
-    --pack-ticket=*) PACK_TICKET=${a#--pack-ticket=}; PACK_TICKET_SET=1 ;;
     # yolo never reaches the worker: it is firstmate's merge authority, not a
     # brief input. Refuse it loudly so it is never silently dropped here and then
     # believed to have been recorded.
@@ -444,37 +407,6 @@ if [ "$KIND" = secondmate ] && [ "$HERDR_LAB" -eq 1 ]; then
   exit 1
 fi
 
-if [ "$PACK_SET" -eq 1 ] || [ "$PACK_KIND_SET" -eq 1 ] || [ "$PACK_LABELS_SET" -eq 1 ] || [ "$PACK_TICKET_SET" -eq 1 ]; then
-  [ "$KIND" != secondmate ] || {
-    echo "error: --pack and its --pack-* options apply only to crewmate ship or scout briefs" >&2
-    exit 1
-  }
-  [ "$PACK_SET" -eq 1 ] || {
-    echo "error: --pack-kind, --pack-labels and --pack-ticket require --pack <project>" >&2
-    exit 1
-  }
-  case "$PACK_LABELS" in
-    *[!A-Za-z0-9._,:\ -]*)
-      echo "error: --pack-labels takes comma-separated labels, got '$PACK_LABELS'" >&2
-      exit 1 ;;
-  esac
-  if [ "$PACK_TICKET_SET" -eq 1 ] && [ ! -f "$PACK_TICKET" ]; then
-    echo "error: --pack-ticket must name a readable file, got '$PACK_TICKET'" >&2
-    exit 1
-  fi
-  case "$PACK_PROJECT" in
-    ''|.|..|*[!A-Za-z0-9._-]*)
-      echo "error: --pack takes a project id ([A-Za-z0-9._-]), got '$PACK_PROJECT'" >&2
-      exit 1 ;;
-  esac
-  case "$PACK_KIND" in
-    *[!A-Za-z0-9._-]*)
-      echo "error: --pack-kind takes a kind label ([A-Za-z0-9._-]), got '$PACK_KIND'" >&2
-      exit 1 ;;
-  esac
-  [ -n "$PACK_KIND" ] || PACK_KIND=default
-fi
-
 if [ "$NO_PROJECTS" -eq 1 ] && [ "$KIND" != secondmate ]; then
   echo "error: --no-projects applies only to --secondmate charters" >&2
   exit 1
@@ -507,55 +439,7 @@ append_brief_include() {
 
 BRIEF="$DATA/$ID/brief.md"
 [ -e "$BRIEF" ] && { echo "error: $BRIEF already exists" >&2; exit 1; }
-
-# The pack is resolved and its section rendered before the brief exists, so a
-# refusal leaves nothing behind; the same resolve is recorded only after the
-# brief is written (record_pack_section below).
-PACK_SECTION=
-PACK_RESOLVE=
-if [ "$PACK_SET" -eq 1 ]; then
-  PACK_RESOLVE=$(mktemp "${TMPDIR:-/tmp}/fm-brief-pack.XXXXXX")
-  trap 'rm -f "$PACK_RESOLVE"' EXIT
-  pack_args=("$PACK_PROJECT" --kind "$PACK_KIND")
-  [ "$PACK_LABELS_SET" -eq 0 ] || pack_args+=(--labels "$PACK_LABELS")
-  [ "$PACK_TICKET_SET" -eq 0 ] || pack_args+=(--ticket "$PACK_TICKET")
-  FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" FM_CONFIG_OVERRIDE="$CONFIG" \
-    "$SCRIPT_DIR/fm-pack.sh" resolve "${pack_args[@]}" --json > "$PACK_RESOLVE" || {
-    echo "error: --pack $PACK_PROJECT: the pack could not be resolved; the brief was not written" >&2
-    exit 1
-  }
-  PACK_SECTION=$(FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" FM_CONFIG_OVERRIDE="$CONFIG" \
-    "$SCRIPT_DIR/fm-pack.sh" render-brief "$PACK_PROJECT" --from-file "$PACK_RESOLVE" --task "$ID" \
-    --heading-level 2 --require-ready) || {
-    echo "error: --pack $PACK_PROJECT: the pack is not ready for this task (reason above); the brief was not written" >&2
-    exit 1
-  }
-  [ -n "$PACK_SECTION" ] \
-    || echo "note: --pack $PACK_PROJECT: no pack is bound to that project; the brief carries no Playbook section" >&2
-fi
 mkdir -p "$DATA/$ID"
-
-# Append the pack's Playbook section after the contract and before any home
-# brief additions, then freeze the resolve it was rendered from. A record that
-# cannot be written removes the brief this run just wrote, so the two never
-# disagree.
-append_pack_section() {
-  if [ -z "$PACK_SECTION" ]; then
-    # A brief with no Playbook must not sit beside a record from an earlier
-    # scaffold of the same task id.
-    rm -f "$DATA/$ID/pack.json"
-    return 0
-  fi
-  printf '\n%s\n' "$PACK_SECTION" >> "$BRIEF"
-  local pack_out
-  pack_out=$(FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" FM_CONFIG_OVERRIDE="$CONFIG" \
-    "$SCRIPT_DIR/fm-pack.sh" record "${pack_args[@]}" --task "$ID" --from-file "$PACK_RESOLVE" --replace --json) || {
-    printf '%s\n' "$pack_out" >&2
-    rm -f "$BRIEF"
-    echo "error: --pack $PACK_PROJECT: the pack record could not be written (refusal above); the brief was removed" >&2
-    exit 1
-  }
-}
 
 ASK_USER_BLOCK=
 if [ "$KIND" = ship ] && [ "$MODE" = no-mistakes ]; then
@@ -742,11 +626,10 @@ HERDR_SECTION=$(printf '%s\n' \
 '   It re-checks refuse-default immediately before stop and again immediately before delete, and fails closed on ambiguity.' \
 '4. If an experiment requires a deliberate mid-run session stop, use only `"$HERDR_LAB_HELPER" stop "$HERDR_LAB_SESSION"`; it performs the same immediate refuse-default check.' \
 '5. Forbidden commands: direct `herdr server stop`, every other server-global operation such as `herdr server live-handoff` or reload/update operations, direct `herdr session stop`, direct `herdr session delete`, and any Herdr call scoped only by ambient or inline `HERDR_SESSION`.' \
-'6. The helper records the live default session before provisioning and verifies the identical fleet state after teardown.' \
-'   A missing, stopped, or changed default session is a hard tripwire failure, never a cleanup warning to ignore.' \
+'6. See the `bin/fm-herdr-lab.sh` header for the fleet-state tripwire and `FM_HERDR_LAB_FLEET_SESSION` rule.' \
+'   A missing, stopped, or changed fleet session is a hard tripwire failure, never a cleanup warning to ignore.' \
 '' \
-'Never bypass the helper, even for a read-only lifecycle probe or cleanup after failure.' \
-'The captain fleet uses the running `default` session.')
+'Never bypass the helper, even for a read-only lifecycle probe or cleanup after failure.')
 else
 IFS= read -r -d '' HERDR_SECTION <<'EOF' || true
 # Herdr lifecycle declaration - NOT ENABLED
@@ -868,7 +751,6 @@ If the command refuses, report the refusal to firstmate and stop rather than byp
 When the report is complete, append \`done [at=<epoch>]: {one-line conclusion}\` to the status file and stop.
 If your findings reveal work that should ship (e.g. you reproduced a bug and the fix is clear), say so in the report; firstmate may promote this task in place, and you would then receive mode-specific ship instructions as a follow-up message.
 EOF
-append_pack_section
 append_brief_include
 echo "scaffolded: $BRIEF (scout; replace {TASK} and {FIRSTMATE_SPEC})"
 exit 0
@@ -948,7 +830,6 @@ A correction edits only the wrong text: do not run \`$FM_ROOT/bin/fm-ensure-agen
 
 $DOD
 EOF
-append_pack_section
 append_brief_include
 if [ "$PR_TEXT" = manual ]; then
   echo "scaffolded: $BRIEF (ship, mode=$MODE pr=manual; replace {TASK} and {FIRSTMATE_SPEC})"

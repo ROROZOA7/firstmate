@@ -42,53 +42,6 @@ test_predicate_healthy_no_inflight() {
   pass "fm_supervision_unhealthy: false with no state/*.meta at all"
 }
 
-test_predicate_idle_inbox_listening() {
-  local home="$TMP_ROOT/pred-inbox" state config
-  state="$home/state"
-  config="$home/config"
-  mkdir -p "$state" "$config"
-  : > "$config/inbox-listen"
-  FM_HOME="$home" fm_supervision_needed "$state" 300 \
-    || fail "an opted-in idle inbox must keep supervision needed"
-  [ "$FM_SUP_IN_FLIGHT" -eq 0 ] && [ "$FM_SUP_SOURCES" -eq 0 ] && [ "$FM_SUP_CHECKS" -eq 0 ] \
-    || fail "inbox availability must not invent tasks, sources, or checks"
-  [ "$FM_SUP_INBOX_LISTEN" = true ] || fail "the inbox-listen reason must be explicit"
-  : > "$state/last.meta"
-  FM_HOME="$home" fm_supervision_needed "$state" 300 || fail "active home must need supervision"
-  rm "$state/last.meta"
-  FM_HOME="$home" fm_supervision_needed "$state" 300 \
-    || fail "removing the final task must not stop idle inbox listening"
-  FM_HOME="$home" fm_supervision_unhealthy "$state" 300 \
-    || fail "an opted-in inbox with no consumer must still report unhealthy"
-  touch "$state/.last-watcher-beat"
-  if FM_HOME="$home" fm_supervision_unhealthy "$state" 300; then
-    fail "an opted-in inbox with a fresh beacon must not report unhealthy"
-  fi
-  rm "$config/inbox-listen"
-  if FM_HOME="$home" fm_supervision_needed "$state" 300; then
-    fail "removing the explicit opt-in must restore the idle default"
-  fi
-  pass "fm_supervision_needed: inbox opt-in keeps idle and final-task removal supervised without fake work"
-}
-
-test_predicate_inbox_config_scope() {
-  local home="$TMP_ROOT/pred-inbox-scope" other="$TMP_ROOT/pred-inbox-other"
-  mkdir -p "$home/state" "$home/config" "$other/config"
-  : > "$home/config/inbox-listen"
-  if FM_HOME="$home" FM_CONFIG_OVERRIDE="$other/config" fm_supervision_needed "$home/state" 300; then
-    fail "an explicit config override must not read another config's inbox opt-in"
-  fi
-  : > "$other/config/inbox-listen"
-  FM_HOME="$home" FM_CONFIG_OVERRIDE="$other/config" fm_supervision_needed "$home/state" 300 \
-    || fail "the effective config override must control inbox listening"
-  if FM_HOME="$other" fm_supervision_needed "$TMP_ROOT/pred-empty/state" 300; then
-    : # FM_HOME, not the unrelated state directory's parent, owns config.
-  else
-    fail "an explicit operational home must own the config lookup"
-  fi
-  pass "fm_supervision_needed: inbox listening follows effective home and config overrides"
-}
-
 test_predicate_unhealthy_no_beacon() {
   local state="$TMP_ROOT/pred-nobeat/state"
   mkdir -p "$state"
@@ -243,6 +196,7 @@ install_guard_scripts() {
   cp "$ROOT/bin/fm-path-lib.sh" "$dir/bin/fm-path-lib.sh"
   cp "$ROOT/bin/fm-hook-host-lib.sh" "$dir/bin/fm-hook-host-lib.sh"
   cp "$ROOT/bin/fm-session-lock-lib.sh" "$dir/bin/fm-session-lock-lib.sh"
+  cp "$ROOT/bin/fm-omp-process-lib.sh" "$dir/bin/fm-omp-process-lib.sh"
   cp "$ROOT/bin/fm-cursor-lib.sh" "$dir/bin/fm-cursor-lib.sh"
   # Launch probe sibling of fm-cursor-lib.sh; keep it next to the copy so a
   # fixture that ever verifies an executable does not source a missing file.
@@ -943,7 +897,8 @@ test_tracked_claude_entries_inert_under_grok() {
   dir="$TMP_ROOT/claude-entries-grok-inert"
   mkdir -p "$dir/bin"
   for script in fm-turnend-guard.sh fm-claude-stop-autoarm.sh fm-sessionstart-run.sh \
-    fm-arm-pretool-check.sh fm-cd-pretool-check.sh fm-subagent-pretool-check.sh fm-host-mirror.sh; do
+    fm-arm-pretool-check.sh fm-cd-pretool-check.sh fm-subagent-pretool-check.sh fm-host-mirror.sh \
+    fm-stow-guard.sh; do
     printf '#!/usr/bin/env bash\nprintf ran >> %q\n' "$dir/invoked" > "$dir/bin/$script"
     chmod +x "$dir/bin/$script"
   done
@@ -984,7 +939,7 @@ test_tracked_claude_entries_inert_under_grok() {
       || fail "tracked entry for $target ran under a legacy GROK_AGENT environment"
   done < <(jq -r '.hooks[][].hooks[].command' "$ROOT/.claude/settings.json")
 
-  [ "$guarded" -eq 8 ] || fail "expected 8 grok-guarded tracked entries, saw $guarded"
+  [ "$guarded" -eq 9 ] || fail "expected 9 grok-guarded tracked entries, saw $guarded"
   [ "$unguarded" -eq 1 ] || fail "expected 1 documented unguarded tracked entry, saw $unguarded"
   pass "tracked .claude/settings.json entries: $guarded inert under grok, the documented subagent exception still armed, all live under Claude"
 }
@@ -1543,6 +1498,7 @@ install_integrated_autoarm() {
   cp "$ROOT/bin/fm-path-lib.sh" "$dir/bin/fm-path-lib.sh"
   cp "$ROOT/bin/fm-hook-host-lib.sh" "$dir/bin/fm-hook-host-lib.sh"
   cp "$ROOT/bin/fm-session-lock-lib.sh" "$dir/bin/fm-session-lock-lib.sh"
+  cp "$ROOT/bin/fm-omp-process-lib.sh" "$dir/bin/fm-omp-process-lib.sh"
   cp "$ROOT/bin/fm-cursor-lib.sh" "$dir/bin/fm-cursor-lib.sh"
   # Launch probe sibling of fm-cursor-lib.sh; keep it next to the copy so a
   # fixture that ever verifies an executable does not source a missing file.
@@ -2708,8 +2664,6 @@ test_hook_no_afk_ignores_poll_derived_grace() {
 }
 
 test_predicate_healthy_no_inflight
-test_predicate_idle_inbox_listening
-test_predicate_inbox_config_scope
 test_predicate_unhealthy_no_beacon
 test_predicate_unhealthy_stale_beacon
 test_predicate_healthy_fresh_beacon

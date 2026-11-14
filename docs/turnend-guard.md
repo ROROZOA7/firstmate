@@ -35,7 +35,7 @@ The turn-end guard closes the remaining gap at the primary's own turn boundary.
 
 The guard acts at that boundary when both of these hold:
 
-- The home needs supervision under `bin/fm-supervision-lib.sh`'s shared predicate.
+- Work, a process-event source, a registered custom check, or Relay polling needs supervision.
 - No identity-matched watcher has a fresh beacon.
 
 The beacon is `state/.last-watcher-beat`, which `bin/fm-watch.sh` touches every cycle, as [Guard grace and the poll cadence](#guard-grace-and-the-poll-cadence) describes.
@@ -73,7 +73,13 @@ It also requires `AGENTS.md`, `bin/`, and the effective state directory.
 
 ### Supervision need
 
-`bin/fm-supervision-lib.sh` owns the shared supervision-need predicate; [idle inbox availability](configuration.md#idle-inbox-availability-configinbox-listen) documents the home-local listening opt-in.
+For an in-scope primary, the guard counts in-flight work from `state/*.meta`.
+These sources also count toward supervision need:
+
+- Registered `state/procevent/*.source` records require supervision even though they have no task metadata.
+- Every mode treats `state/x-watch.check.sh` as supervision need, so Relay polling remains guarded without an in-flight task.
+- A custom check registered with `bin/fm-check-register.sh` counts the same way, so an operator's home-level poll keeps running after the last task is torn down.
+
 The default cross-harness mode exits silently with no supervision need.
 
 ### Strict watcher check at the turn boundary
@@ -358,8 +364,12 @@ Pinning that signal to the session-lock identity recorded at claim time is what 
 An orphan fails both signals: it no longer descends from the replacement's lock pid, and its recorded lock-holder identity is the dead session's.
 An entry from a build before these fields existed records neither and falls back to descent alone.
 
+The auto-arm also records the Stop payload's `session_id` on line 1 as `claude_session`, which later writes of that generation keep, and a firing from another Claude session does not find that claim open.
+Claude delivers a hook's exit-2 rewake to the session that launched the hook, so a claim taken before Claude continued the conversation under a new session id, as a backgrounded session's `--fork-session` resume does, can only wake a conversation that no longer runs, even while its owner still descends from the lock-holding front end.
+A claim or a payload with no session id is judged as before, and so is every check the guard itself makes, because it names no session.
+
 Anything else lets the next Stop-owned firing take the next generation and arm.
-That covers a finished outcome, a dead or identity-mismatched owner, an owner orphaned by its session's exit, a stuck owner, an identityless entry, or no entry.
+That covers a finished outcome, a dead or identity-mismatched owner, an owner orphaned by its session's exit, a stuck owner, an identityless entry, an earlier session's claim, or no entry.
 Taking a newer generation is the reclaim, and a steady-state predecessor is never signalled or revoked.
 
 No mutex is held across arming or output.
